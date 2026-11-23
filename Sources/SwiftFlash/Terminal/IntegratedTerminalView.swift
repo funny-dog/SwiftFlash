@@ -97,9 +97,9 @@ final class TerminalSession: ObservableObject {
 
         isRunning = true
         let cwd = currentDirectory
-        weak let weakSelf = self
 
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let weakSelf = self
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", cmd]
