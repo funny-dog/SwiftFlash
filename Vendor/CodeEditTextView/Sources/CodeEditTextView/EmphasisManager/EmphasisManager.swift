@@ -149,9 +149,13 @@ public final class EmphasisManager {
             guard let shapePath = makeShapePath(
                 forStyle: emphasis.emphasis.style,
                 range: emphasis.emphasis.range
-            ) else {
+            ), !shapePath.isEmpty else {
+                emphasis.layer.path = nil
+                emphasis.layer.isHidden = true
+                emphasis.textLayer?.isHidden = true
                 continue
             }
+            emphasis.layer.isHidden = false
             if #available(macOS 14.0, *) {
                 emphasis.layer.path = shapePath.cgPath
             } else {
@@ -169,6 +173,7 @@ public final class EmphasisManager {
             if let textLayer = emphasis.textLayer {
                 var bounds = shapePath.bounds
                 bounds.origin.y += 1 // Move down by 1 pixel
+                textLayer.isHidden = false
                 textLayer.frame = bounds
             }
         }
@@ -242,6 +247,11 @@ public final class EmphasisManager {
             layer.zPosition = 1
         }
 
+        if shapePath.isEmpty {
+            layer.isHidden = true
+            return layer
+        }
+
         if #available(macOS 14.0, *) {
             layer.path = shapePath.cgPath
         } else {
@@ -259,10 +269,19 @@ public final class EmphasisManager {
     }
 
     private func createTextLayer(for emphasis: Emphasis) -> CATextLayer? {
-        guard let textView = textView,
+        guard case .standard = emphasis.style,
+              emphasis.range.length > 0,
+              let textView = textView,
               let layoutManager = textView.layoutManager,
+              let storage = textView.textStorage,
+              NSMaxRange(emphasis.range) <= storage.length,
               let shapePath = layoutManager.roundedPathForRange(emphasis.range),
-              let originalString = textView.textStorage?.attributedSubstring(from: emphasis.range) else {
+              !shapePath.isEmpty else {
+            return nil
+        }
+
+        let originalString = storage.attributedSubstring(from: emphasis.range)
+        guard originalString.length > 0 else {
             return nil
         }
 

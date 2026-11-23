@@ -96,6 +96,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        workspace?.stopRunningTask()
+        LSPManager.shared.shutdownAll()
+    }
+
     private func parseFolderArgument() -> URL? {
         let args = CommandLine.arguments.dropFirst()
         if let firstPath = args.first {
@@ -196,6 +201,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         workspace.onToggleCommentRequested?()
     }
 
+    @objc private func findAction(_ sender: Any?) {
+        workspace.presentFindBar(replace: false)
+    }
+
+    @objc private func findReplaceAction(_ sender: Any?) {
+        workspace.presentFindBar(replace: true)
+    }
+
+    @objc private func findNextAction(_ sender: Any?) {
+        workspace.findNextInActiveFile()
+    }
+
+    @objc private func findPreviousAction(_ sender: Any?) {
+        workspace.findPreviousInActiveFile()
+    }
+
+    @objc private func goToLineAction(_ sender: Any?) {
+        workspace.presentGoToLine()
+    }
+
+    @objc private func triggerCompletionAction(_ sender: Any?) {
+        workspace.onRequestCompletionAction?()
+    }
+
+    @objc private func goToDefinitionAction(_ sender: Any?) {
+        workspace.onGoToDefinitionAction?()
+    }
+
+    @objc private func runProjectAction(_ sender: Any?) {
+        workspace.runDefaultRunTask()
+    }
+
+    @objc private func testProjectAction(_ sender: Any?) {
+        workspace.runDefaultTestTask()
+    }
+
+    @objc private func stopTaskAction(_ sender: Any?) {
+        workspace.stopRunningTask()
+    }
+
+    @objc private func showProblemsAction(_ sender: Any?) {
+        workspace.showBottomPanel(.problems)
+    }
+
     // MARK: - Main Menu Bar Construction
 
     private func buildMainMenu() {
@@ -239,7 +288,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(makeItem(L10n("menu.edit.selectAll"), action: #selector(NSText.selectAll(_:)), key: "a"))
         editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(makeItem(L10n("menu.edit.toggleComment"), action: #selector(toggleCommentAction(_:)), key: "/"))
+        editMenu.addItem(makeItem(L10n("menu.edit.find"), action: #selector(findAction(_:)), key: "f"))
+        let findReplaceItem = NSMenuItem(title: L10n("menu.edit.findReplace"), action: #selector(findReplaceAction(_:)), keyEquivalent: "f")
+        findReplaceItem.keyEquivalentModifierMask = [.option, .command]
+        editMenu.addItem(findReplaceItem)
+        editMenu.addItem(makeItem(L10n("menu.edit.findNext"), action: #selector(findNextAction(_:)), key: "g"))
+        editMenu.addItem(makeItem(L10n("menu.edit.findPrevious"), action: #selector(findPreviousAction(_:)), key: "G"))
+        editMenu.addItem(makeItem(L10n("menu.edit.goToLine"), action: #selector(goToLineAction(_:)), key: "l"))
         editMenu.addItem(makeItem(L10n("menu.edit.findInWorkspace"), action: #selector(globalSearchAction(_:)), key: "F"))
+        editMenu.addItem(NSMenuItem.separator())
+        let completionItem = NSMenuItem(title: L10n("menu.edit.triggerCompletion"), action: #selector(triggerCompletionAction(_:)), keyEquivalent: " ")
+        completionItem.keyEquivalentModifierMask = [.control]
+        editMenu.addItem(completionItem)
+        editMenu.addItem(NSMenuItem(title: L10n("menu.edit.goToDefinition"), action: #selector(goToDefinitionAction(_:)), keyEquivalent: ""))
 
         // View Menu
         let viewMenuItem = NSMenuItem()
@@ -260,6 +321,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewDiffItem.keyEquivalentModifierMask = [.control, .command]
         viewMenu.addItem(viewDiffItem)
         viewMenu.addItem(makeItem(L10n("menu.view.toggleTerminal"), action: #selector(toggleTerminalAction(_:)), key: "j"))
+        viewMenu.addItem(NSMenuItem(title: L10n("menu.view.showProblems"), action: #selector(showProblemsAction(_:)), keyEquivalent: ""))
+
+        // Run Menu
+        let runMenuItem = NSMenuItem()
+        mainMenu.addItem(runMenuItem)
+        let runMenu = NSMenu(title: L10n("menu.run"))
+        runMenuItem.submenu = runMenu
+        runMenu.addItem(makeItem(L10n("menu.run.run"), action: #selector(runProjectAction(_:)), key: "r"))
+        runMenu.addItem(makeItem(L10n("menu.run.test"), action: #selector(testProjectAction(_:)), key: "u"))
+        runMenu.addItem(makeItem(L10n("menu.run.stop"), action: #selector(stopTaskAction(_:)), key: "."))
     }
 
     private func makeItem(_ title: String, action: Selector, key: String) -> NSMenuItem {

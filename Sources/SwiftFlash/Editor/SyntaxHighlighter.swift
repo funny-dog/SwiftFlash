@@ -108,6 +108,13 @@ final class SyntaxHighlighter: @unchecked Sendable {
         "set", "unset", "echo", "exit", "true", "false"
     ])
 
+    private let goKeywords = Set([
+        "break", "case", "chan", "const", "continue", "default", "defer", "else",
+        "fallthrough", "for", "func", "go", "goto", "if", "import", "interface",
+        "map", "package", "range", "return", "select", "struct", "switch", "type",
+        "var", "nil", "true", "false", "iota", "error"
+    ])
+
     private let identifierRegex = try! NSRegularExpression(pattern: #"\b[A-Za-z_][A-Za-z0-9_]*\b"#)
     private let functionCallRegex = try! NSRegularExpression(pattern: #"\b([a-z_][A-Za-z0-9_]*)\s*\("#)
     private let numberRegex = try! NSRegularExpression(pattern: #"\b(?:0x[0-9A-Fa-f_]+|0b[01_]+|\d[\d_]*(?:\.[\d_]+)?)\b"#)
@@ -187,6 +194,7 @@ final class SyntaxHighlighter: @unchecked Sendable {
         case .typescript, .javascript: keywords = jsKeywords
         case .c: keywords = cKeywords
         case .shell: keywords = shellKeywords
+        case .go: keywords = goKeywords
         default: keywords = []
         }
 
@@ -237,7 +245,7 @@ final class SyntaxHighlighter: @unchecked Sendable {
             for m in hashCommentRegex.matches(in: slice, range: fullRange) {
                 tokens.append(HighlightToken(range: shifted(m.range, by: baseOffset), colorHex: palette.commentHex))
             }
-        case .swift, .rust, .typescript, .javascript, .c, .css:
+        case .swift, .rust, .typescript, .javascript, .c, .css, .go:
             for m in blockCommentRegex.matches(in: slice, range: fullRange) {
                 tokens.append(HighlightToken(range: shifted(m.range, by: baseOffset), colorHex: palette.commentHex))
             }

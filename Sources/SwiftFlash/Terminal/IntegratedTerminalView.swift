@@ -268,6 +268,7 @@ private enum ANSITextParser {
 struct IntegratedTerminalView: View {
     @ObservedObject var workspace: WorkspaceState
     @ObservedObject var session: TerminalSession
+    var showHeader: Bool = true
     @ObservedObject private var themeManager = ThemeManager.shared
 
     private var terminalFont: Font {
@@ -283,8 +284,9 @@ struct IntegratedTerminalView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Terminal Header Bar
-            HStack(spacing: 10) {
+            if showHeader {
+                // Terminal Header Bar
+                HStack(spacing: 10) {
                 HStack(spacing: 5) {
                     Image(systemName: "terminal.fill")
                         .font(.system(size: 11))
@@ -348,6 +350,7 @@ struct IntegratedTerminalView: View {
             }
             .overlay(alignment: .bottom) {
                 Rectangle().fill(Color(nsColor: ZedTheme.border)).frame(height: 1)
+            }
             }
 
             // Output Scroll Area

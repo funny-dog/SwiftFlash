@@ -23,7 +23,13 @@ private struct TitlebarWindowDragArea: NSViewRepresentable {
 
 struct ZedTopHeaderBarView: View {
     @ObservedObject var workspace: WorkspaceState
+    @ObservedObject private var taskRunner: TaskRunnerState
     @ObservedObject private var themeManager = ThemeManager.shared
+
+    init(workspace: WorkspaceState) {
+        self.workspace = workspace
+        self.taskRunner = workspace.taskRunner
+    }
 
     var body: some View {
         ZStack {
@@ -134,6 +140,80 @@ struct ZedTopHeaderBarView: View {
                 .help(L10n("header.branch.help"))
 
                 Spacer(minLength: 16)
+
+                // Run / Test Task Controls
+                if workspace.hasWorkspaceOpen, !taskRunner.detectedTasks.isEmpty {
+                    HStack(spacing: 4) {
+                        Menu {
+                            ForEach(taskRunner.detectedTasks) { task in
+                                Button {
+                                    workspace.runTask(task)
+                                } label: {
+                                    HStack {
+                                        Text("\(task.name)  (\(task.sourceLabel))")
+                                        if task.id == taskRunner.selectedTask?.id {
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(taskRunner.selectedTask?.name ?? L10n("runner.run"))
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundColor(Color(nsColor: ZedTheme.primaryText))
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 5)
+                                    .fill(Color(nsColor: ZedTheme.background))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5)
+                                    .stroke(Color(nsColor: ZedTheme.border).opacity(0.65), lineWidth: 1)
+                            )
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help(L10n("runner.selectTaskHelp"))
+
+                        if taskRunner.isRunning {
+                            headerIconButton(
+                                icon: "stop.fill",
+                                title: nil,
+                                isActive: true,
+                                helpText: L10n("runner.stopHelp")
+                            ) {
+                                workspace.stopRunningTask()
+                            }
+                        } else {
+                            headerIconButton(
+                                icon: "play.fill",
+                                title: nil,
+                                isActive: false,
+                                helpText: L10n("runner.runHelp")
+                            ) {
+                                workspace.runDefaultRunTask()
+                            }
+                        }
+
+                        if taskRunner.detectedTasks.contains(where: { $0.kind == .test }) {
+                            headerIconButton(
+                                icon: "checkmark.diamond",
+                                title: nil,
+                                isActive: false,
+                                helpText: L10n("runner.testHelp")
+                            ) {
+                                workspace.runDefaultTestTask()
+                            }
+                        }
+                    }
+                }
 
                 // Right Utility Controls
                 HStack(spacing: 6) {
@@ -1059,6 +1139,7 @@ struct ThemeAndFontSettingsModalView: View {
     @ObservedObject private var localizationManager = LocalizationManager.shared
     @State private var escapeMonitor: Any?
     @State private var pendingInstallEntry: RemotePluginEntry?
+    @State private var isCloseHovered = false
 
     private let lineHeights: [CGFloat] = [1.2, 1.38, 1.5, 1.65]
 
@@ -1067,7 +1148,7 @@ struct ThemeAndFontSettingsModalView: View {
             // Header
             HStack {
                 HStack(spacing: 8) {
-                    Image(systemName: "paintbrush.pointed.fill")
+                    Image(systemName: workspace.preferredSettingsSection == .appearance ? "paintbrush.pointed.fill" : "server.rack")
                         .font(.system(size: 13))
                         .foregroundColor(Color(nsColor: ZedTheme.function))
                     Text(L10n("settings.title"))
@@ -1077,18 +1158,39 @@ struct ThemeAndFontSettingsModalView: View {
 
                 Spacer()
 
+                HStack(spacing: 4) {
+                    settingsTabPill(tab: .appearance, title: L10n("settings.tab.appearance"))
+                    settingsTabPill(tab: .languageServers, title: L10n("settings.tab.languageServers"))
+                }
+                .padding(2)
+                .background(Color(nsColor: ZedTheme.background))
+                .cornerRadius(7)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .stroke(Color(nsColor: ZedTheme.border), lineWidth: 1)
+                )
+
+                Spacer().frame(width: 10)
+
                 Button {
                     workspace.dismissOverlay()
                 } label: {
-                    Text("ESC")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(Color(nsColor: ZedTheme.mutedText))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color(nsColor: ZedTheme.background))
-                        .cornerRadius(4)
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color(nsColor: isCloseHovered ? ZedTheme.primaryText : ZedTheme.secondaryText))
+                        .frame(width: 24, height: 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color(nsColor: isCloseHovered ? ZedTheme.hoverBackground : ZedTheme.background))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color(nsColor: ZedTheme.border), lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
+                .onHover { isCloseHovered = $0 }
+                .help("\(L10n("common.close")) (ESC)")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -1096,6 +1198,10 @@ struct ThemeAndFontSettingsModalView: View {
             Divider().overlay(Color(nsColor: ZedTheme.border))
 
             ScrollView {
+                if workspace.preferredSettingsSection == .languageServers {
+                    LSPSettingsView(workspace: workspace)
+                        .padding(16)
+                } else {
                 VStack(alignment: .leading, spacing: 18) {
                     // Language & Plugins Section
                     languageAndPluginsSection
@@ -1242,10 +1348,11 @@ struct ThemeAndFontSettingsModalView: View {
                     }
                 }
                 .padding(16)
+                }
             }
             .frame(maxHeight: 540)
         }
-        .frame(width: 560)
+        .frame(width: 600)
         .background(Color(nsColor: ZedTheme.sidebarBackground))
         .cornerRadius(12)
         .overlay(
@@ -1614,6 +1721,24 @@ struct ThemeAndFontSettingsModalView: View {
                     )
             }
         }
+    }
+
+    private func settingsTabPill(tab: WorkspaceState.SettingsSection, title: String) -> some View {
+        let isActive = workspace.preferredSettingsSection == tab
+        return Button {
+            workspace.preferredSettingsSection = tab
+        } label: {
+            Text(title)
+                .font(.system(size: 11, weight: isActive ? .semibold : .medium))
+                .foregroundColor(Color(nsColor: isActive ? ZedTheme.pillText : ZedTheme.secondaryText))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(isActive ? Color(nsColor: ZedTheme.pillBackground) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     private func themeCard(for id: ThemeID) -> some View {

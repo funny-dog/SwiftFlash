@@ -45,7 +45,11 @@ final class EditorTerminalSplitController: NSSplitViewController {
         editorItem.holdingPriority = NSLayoutConstraint.Priority(200)
 
         let terminalVC = NSHostingController(
-            rootView: IntegratedTerminalView(workspace: workspace, session: terminalSession)
+            rootView: BottomPanelView(
+                workspace: workspace,
+                session: terminalSession,
+                taskRunner: workspace.taskRunner
+            )
         )
         terminalVC.safeAreaRegions = []
         terminalSplitItem = NSSplitViewItem(viewController: terminalVC)
@@ -65,6 +69,14 @@ final class EditorTerminalSplitController: NSSplitViewController {
         workspace.isTerminalVisible = !shouldCollapse
         if shouldCollapse {
             workspace.onFocusEditorRequested?()
+        }
+    }
+
+    func showBottomPanel(tab: BottomPanelTab) {
+        workspace.bottomPanelTab = tab
+        if terminalSplitItem.isCollapsed {
+            terminalSplitItem.animator().isCollapsed = false
+            workspace.isTerminalVisible = true
         }
     }
 }
@@ -116,6 +128,9 @@ final class MainSplitViewController: NSSplitViewController {
         }
         workspace.onToggleTerminalAction = { [weak self] in
             self?.toggleTerminal()
+        }
+        workspace.onShowBottomPanelAction = { [weak self] tab in
+            self?.rightSplitController.showBottomPanel(tab: tab)
         }
     }
 

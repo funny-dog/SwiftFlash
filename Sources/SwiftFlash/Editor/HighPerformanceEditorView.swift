@@ -255,6 +255,7 @@ final class FlashTextView: TextView {
 final class EditorGutterView: NSView {
     weak var textView: FlashTextView?
     weak var scrollView: NSScrollView?
+    var lineSeverities: [Int: LSPDiagnosticSeverity] = [:]
     var activeLineIndex: Int = 0 {
         didSet {
             if oldValue != activeLineIndex {
@@ -303,6 +304,12 @@ final class EditorGutterView: NSView {
                 NSRect(x: 0, y: yInGutter, width: bounds.width - 1, height: linePos.height).fill()
             }
 
+            if let sev = lineSeverities[linePos.index] {
+                NSColor(hex: sev.colorHex).setFill()
+                let dotRect = NSRect(x: 5, y: yInGutter + (linePos.height - 5) / 2.0, width: 5, height: 5)
+                NSBezierPath(ovalIn: dotRect).fill()
+            }
+
             let label = "\(linePos.index + 1)"
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: isCurrent ? activeGutterFont : gutterFont,
@@ -346,9 +353,15 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     private var isProgrammaticUpdate = false
     private var highlightRevision: Int = 0
     private var highlightTask: Task<Void, Never>?
+    private var completionTask: Task<Void, Never>?
+    private var completionRevision: Int = 0
+    private var pendingCompletionInsertedString: String?
     private var observers: [NSObjectProtocol] = []
     private var themeCancellables: Set<AnyCancellable> = []
     private var keyMonitor: Any?
+
+    let completionState = CompletionState()
+    private var completionHostingView: NSHostingView<CompletionPopupView>?
 
     private var editorFont: NSFont {
         ThemeManager.shared.editorFont
@@ -383,6 +396,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
     deinit {
         highlightTask?.cancel()
+        completionTask?.cancel()
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
         }
@@ -430,10 +444,37 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
+
+        let popup = CompletionPopupView(state: completionState) { [weak self] item in
+            self?.acceptCompletion(item)
+        }
+        let hosting = NSHostingView(rootView: popup)
+        hosting.wantsLayer = true
+        hosting.layer?.zPosition = 500
+        hosting.sizingOptions = []
+        hosting.isHidden = true
+        addSubview(hosting, positioned: .above, relativeTo: scrollView)
+        self.completionHostingView = hosting
     }
 
     private func setupObservers() {
         scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let textDidChangeObs = NotificationCenter.default.addObserver(
+            forName: TextView.textDidChangeNotification,
+            object: textView,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if let inserted = self.pendingCompletionInsertedString {
+                    self.pendingCompletionInsertedString = nil
+                    self.textView.layoutManager.layoutLines()
+                    self.handleTypingForCompletion(insertedString: inserted)
+                }
+            }
+        }
+        observers.append(textDidChangeObs)
 
         let scrollObs = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -445,6 +486,13 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 self.gutterView.needsDisplay = true
                 self.workspace?.updateActiveTabScroll(y: self.scrollView.documentVisibleRect.origin.y)
                 self.scheduleViewportHighlight(debounceMs: 12)
+                if self.workspace?.findState.isFindBarVisible == true {
+                    self.updateFindEmphases()
+                }
+                if self.completionState.isVisible {
+                    self.completionState.dismiss()
+                    self.completionHostingView?.isHidden = true
+                }
             }
         }
         observers.append(scrollObs)
@@ -460,16 +508,81 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         }
         observers.append(selObs)
 
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
             guard let self,
                   self.workspace?.activeOverlay == OverlayPanelMode.none,
                   let window = self.window,
-                  window.firstResponder === self.textView,
+                  event.window === window else {
+                return event
+            }
+
+            if event.type == .leftMouseDown {
+                if let hosting = self.completionHostingView, !hosting.isHidden {
+                    let ptInContainer = self.convert(event.locationInWindow, from: nil)
+                    if !hosting.frame.contains(ptInContainer) {
+                        self.dismissCompletion()
+                    }
+                }
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                if flags.contains(.command), event.clickCount == 1 {
+                    let pt = self.textView.convert(event.locationInWindow, from: nil)
+                    if self.textView.bounds.contains(pt),
+                       let offset = self.textView.layoutManager.textOffsetAtPoint(pt) {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.goToDefinition(atOffset: offset)
+                        }
+                    }
+                }
+                return event
+            }
+
+            guard window.firstResponder === self.textView,
                   !self.textView.hasMarkedText() else {
                 return event
             }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            // Completion popup navigation & acceptance
+            if self.completionState.isVisible {
+                switch Int(event.keyCode) {
+                case 126: // Up
+                    self.completionState.moveUp()
+                    return nil
+                case 125: // Down
+                    self.completionState.moveDown()
+                    return nil
+                case 53: // ESC
+                    self.dismissCompletion()
+                    return nil
+                case 123, 124, 115, 119, 116, 121: // Left, Right, Home, End, PageUp, PageDown
+                    self.dismissCompletion()
+                case 48, 36: // Tab or Return
+                    if modifiers.isDisjoint(with: [.command, .control, .option]) {
+                        if let item = self.completionState.selectedItem {
+                            self.acceptCompletion(item)
+                            return nil
+                        }
+                    }
+                default:
+                    break
+                }
+            }
+
+            // Manual Completion Trigger: Ctrl+Space (49) or Option+ESC (53)
+            if (Int(event.keyCode) == 49 && modifiers == [.control])
+                || (Int(event.keyCode) == 53 && modifiers == [.option]) {
+                self.triggerCompletion(forceShow: true)
+                return nil
+            }
+
+            // F12 (111): Go to Definition
+            if Int(event.keyCode) == 111 && modifiers.isEmpty {
+                let offset = self.textView.selectionManager.textSelections.first?.range.location ?? 0
+                self.goToDefinition(atOffset: offset)
+                return nil
+            }
+
             // Tab (48) & Shift+Tab
             if Int(event.keyCode) == 48 && !modifiers.contains(.command) && !modifiers.contains(.control) && !modifiers.contains(.option) {
                 if modifiers.contains(.shift) {
@@ -583,11 +696,15 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 let safeLoc = min(tab.selectedRange.location, textView.textStorage.length)
                 let safeLen = min(tab.selectedRange.length, max(0, textView.textStorage.length - safeLoc))
                 textView.selectionManager.setSelectedRange(NSRange(location: safeLoc, length: safeLen))
-                scrollView.contentView.scroll(to: NSPoint(x: 0, y: tab.scrollOffsetY))
+                let targetY = tab.scrollOffsetY ?? -scrollView.contentInsets.top
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
                 scrollView.reflectScrolledClipView(scrollView.contentView)
             }
 
             isProgrammaticUpdate = false
+            dismissCompletion()
+            refreshDiagnosticsOverlay()
+            applyOverlayAttributes()
             gutterView.needsDisplay = true
             updateCursorStatus()
             scheduleViewportHighlight(debounceMs: 0)
@@ -616,6 +733,26 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         }
     }
 
+    func highlightAndScroll(to range: NSRange) {
+        guard let storage = textView.textStorage else { return }
+        let safeLoc = min(range.location, storage.length)
+        let safeLen = min(range.length, max(0, storage.length - safeLoc))
+        let clamped = NSRange(location: safeLoc, length: safeLen)
+        textView.selectionManager.setSelectedRange(clamped)
+        textView.scrollToRange(clamped, center: true)
+        applyOverlayAttributes()
+    }
+
+    func replaceRange(_ range: NSRange, with replacement: String) {
+        guard let storage = textView.textStorage, range.max <= storage.length else { return }
+        textView.replaceCharacters(in: range, with: replacement)
+    }
+
+    func replaceEntireDocument(with newText: String) {
+        guard let storage = textView.textStorage else { return }
+        textView.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: newText)
+    }
+
     // MARK: - TextViewDelegate
 
     nonisolated func textView(_ textView: TextView, didReplaceContentsIn range: NSRange, with string: String) {
@@ -624,6 +761,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             workspace?.updateActiveTabContent(textView.string)
             gutterView.needsDisplay = true
             scheduleViewportHighlight(debounceMs: 18)
+            pendingCompletionInsertedString = string
         }
     }
 
@@ -705,6 +843,344 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             }
         }
     }
+
+    // MARK: - Find Highlights & LSP Diagnostics Overlay
+
+    func applyOverlayAttributes() {
+        updateFindEmphases()
+        updateDiagnosticEmphases()
+    }
+
+    func refreshDiagnosticsOverlay() {
+        var map: [Int: LSPDiagnosticSeverity] = [:]
+        for diag in workspace?.diagnosticsForActiveTab ?? [] {
+            let line = diag.range.start.line
+            if let existing = map[line] {
+                if diag.severity.rawValue < existing.rawValue {
+                    map[line] = diag.severity
+                }
+            } else {
+                map[line] = diag.severity
+            }
+        }
+        gutterView.lineSeverities = map
+        gutterView.needsDisplay = true
+        updateDiagnosticEmphases()
+    }
+
+    private func updateFindEmphases() {
+        guard let emphasisManager = textView.emphasisManager else { return }
+        guard let findState = workspace?.findState, findState.isFindBarVisible, !findState.matches.isEmpty else {
+            emphasisManager.removeEmphases(for: "find-matches")
+            return
+        }
+
+        textView.layoutManager.layoutLines()
+        let matches = findState.matches
+        let activeIdx = findState.currentMatchIndex
+        let visibleRange = textView.visibleTextRange ?? NSRange(location: 0, length: textView.textStorage.length)
+
+        var emphases: [Emphasis] = []
+        emphases.reserveCapacity(min(matches.count, 250))
+
+        for (idx, range) in matches.enumerated() {
+            let isActive = (idx == activeIdx)
+            if isActive || NSIntersectionRange(range, visibleRange).length > 0 || matches.count <= 200 {
+                emphases.append(
+                    Emphasis(
+                        range: range,
+                        style: .standard,
+                        flash: false,
+                        inactive: !isActive,
+                        selectInDocument: false
+                    )
+                )
+            }
+            if emphases.count >= 250 { break }
+        }
+
+        emphasisManager.replaceEmphases(emphases, for: "find-matches")
+        emphasisManager.updateLayerBackgrounds()
+    }
+
+    private func updateDiagnosticEmphases() {
+        guard let emphasisManager = textView.emphasisManager else { return }
+        let diags = workspace?.diagnosticsForActiveTab ?? []
+        guard !diags.isEmpty else {
+            emphasisManager.removeEmphases(for: "lsp-diagnostics")
+            return
+        }
+
+        textView.layoutManager.layoutLines()
+        var emphases: [Emphasis] = []
+        for diag in diags.prefix(200) {
+            guard let range = nsRange(for: diag.range), range.length > 0 else { continue }
+            emphases.append(
+                Emphasis(
+                    range: range,
+                    style: .underline(color: NSColor(hex: diag.severity.colorHex)),
+                    flash: false,
+                    inactive: false,
+                    selectInDocument: false
+                )
+            )
+        }
+        emphasisManager.replaceEmphases(emphases, for: "lsp-diagnostics")
+        emphasisManager.updateLayerBackgrounds()
+    }
+
+    private func nsRange(for lspRange: LSPRange) -> NSRange? {
+        guard let storage = textView.textStorage else { return nil }
+        guard let startLine = textView.layoutManager.textLineForIndex(lspRange.start.line) else { return nil }
+        let startOffset = min(startLine.range.max, startLine.range.location + max(0, lspRange.start.character))
+
+        let endOffset: Int
+        if let endLine = textView.layoutManager.textLineForIndex(lspRange.end.line) {
+            endOffset = min(endLine.range.max, endLine.range.location + max(0, lspRange.end.character))
+        } else {
+            endOffset = min(storage.length, startOffset + 1)
+        }
+
+        let safeStart = max(0, min(startOffset, storage.length))
+        let safeEnd = max(safeStart, min(endOffset, storage.length))
+        if safeEnd == safeStart && safeStart < storage.length {
+            return NSRange(location: safeStart, length: 1)
+        }
+        return NSRange(location: safeStart, length: safeEnd - safeStart)
+    }
+
+    private func lspPosition(for offset: Int) -> LSPPosition? {
+        guard let storage = textView.textStorage else { return nil }
+        return Self.computeLSPPosition(in: storage.string as NSString, at: offset)
+    }
+
+    static func computeLSPPosition(in nsString: NSString, at offset: Int) -> LSPPosition {
+        let clamped = max(0, min(offset, nsString.length))
+        var line = 0
+        var lineStart = 0
+        var i = 0
+        while i < clamped {
+            if nsString.character(at: i) == 0x000A {
+                line += 1
+                lineStart = i + 1
+            }
+            i += 1
+        }
+        return LSPPosition(line: line, character: clamped - lineStart)
+    }
+
+    // MARK: - Code Completion & Go to Definition
+
+    private func handleTypingForCompletion(insertedString: String) {
+        if insertedString.isEmpty {
+            if completionState.isVisible {
+                triggerCompletion(forceShow: false)
+            }
+            return
+        }
+
+        if insertedString == "." {
+            triggerCompletion(forceShow: false)
+            return
+        }
+        if insertedString == ":" {
+            triggerCompletion(forceShow: true)
+            return
+        }
+        if insertedString == " ",
+           textView.currentLanguage == .python,
+           let storage = textView.textStorage {
+            let nsText = storage.string as NSString
+            let cursor = textView.selectionManager.textSelections.first?.range.location ?? 0
+            let lineRange = nsText.lineRange(for: NSRange(location: min(cursor, nsText.length), length: 0))
+            let before = nsText.substring(with: NSRange(location: lineRange.location, length: max(0, cursor - lineRange.location)))
+            let ctx = LocalCompletionProvider.detectPythonLineContext(beforeCursorOnLine: before)
+            if ctx != .general {
+                triggerCompletion(forceShow: true)
+                return
+            }
+        }
+
+        let isAllWordChars = !insertedString.isEmpty && insertedString.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || $0 == "_"
+        }
+        if isAllWordChars {
+            triggerCompletion(forceShow: false)
+        } else {
+            dismissCompletion()
+        }
+    }
+
+    func triggerCompletion(forceShow: Bool) {
+        completionTask?.cancel()
+        completionRevision &+= 1
+        let rev = completionRevision
+
+        guard let storage = textView.textStorage else { return }
+        let nsText = storage.string as NSString
+        let cursor = min(textView.selectionManager.textSelections.first?.range.location ?? 0, nsText.length)
+        let prefixRange = LocalCompletionProvider.identifierPrefixRange(in: nsText, at: cursor)
+        let prefix = nsText.substring(with: prefixRange)
+        let lineRange = nsText.lineRange(for: NSRange(location: cursor, length: 0))
+        let beforeCursorOnLine = nsText.substring(
+            with: NSRange(location: lineRange.location, length: max(0, cursor - lineRange.location))
+        )
+        let prevChar: String? = prefixRange.location > 0
+            ? nsText.substring(with: NSRange(location: prefixRange.location - 1, length: 1))
+            : nil
+
+        let firstPrefixScalar = prefix.unicodeScalars.first
+        let startsWithWordChar = firstPrefixScalar.map { CharacterSet.letters.contains($0) || $0 == "_" } ?? false
+        if !forceShow && !(startsWithWordChar && prefix.count >= 1) && prevChar != "." {
+            dismissCompletion()
+            return
+        }
+
+        let language = textView.currentLanguage
+        let content = storage.string
+
+        // Show local suggestions immediately for instant responsiveness
+        let localItems = LocalCompletionProvider.mergeAndRank(
+            prefix: prefix,
+            language: language,
+            documentText: content,
+            lspItems: [],
+            beforeCursorOnLine: beforeCursorOnLine
+        )
+        if !localItems.isEmpty {
+            showCompletionPopup(items: localItems, prefixRange: prefixRange, cursorOffset: cursor)
+        } else {
+            dismissCompletion()
+        }
+
+        // Also query active LSP in background if document has a file URL
+        guard let workspace,
+              let fileURL = workspace.activeTab?.url else {
+            return
+        }
+        let pos = Self.computeLSPPosition(in: nsText, at: cursor)
+        let root = workspace.rootURL
+        completionTask = Task { [weak self] in
+            let lspItems = await LSPManager.shared.requestCompletions(
+                url: fileURL,
+                language: language,
+                content: content,
+                line: pos.line,
+                character: pos.character,
+                workspaceRoot: root
+            ) ?? []
+
+            await MainActor.run {
+                guard let self, self.completionRevision == rev else { return }
+                let currentCursor = self.textView.selectionManager.textSelections.first?.range.location ?? 0
+                guard currentCursor == cursor else { return }
+                guard !lspItems.isEmpty else { return }
+                let merged = LocalCompletionProvider.mergeAndRank(
+                    prefix: prefix,
+                    language: language,
+                    documentText: content,
+                    lspItems: lspItems,
+                    beforeCursorOnLine: beforeCursorOnLine
+                )
+                if !merged.isEmpty {
+                    self.showCompletionPopup(items: merged, prefixRange: prefixRange, cursorOffset: cursor)
+                }
+            }
+        }
+    }
+
+    private func showCompletionPopup(items: [LSPCompletionItem], prefixRange: NSRange, cursorOffset: Int) {
+        guard !items.isEmpty, let hosting = completionHostingView else {
+            dismissCompletion()
+            return
+        }
+        textView.layoutManager.layoutLines()
+        completionState.show(items: items, prefixRange: prefixRange)
+
+        let anchorOffset = prefixRange.length > 0 ? prefixRange.location : cursorOffset
+        let caretRect: NSRect
+        if let directRect = textView.layoutManager.rectForOffset(anchorOffset) {
+            caretRect = directRect
+        } else if anchorOffset > 0, let prevRect = textView.layoutManager.rectForOffset(anchorOffset - 1) {
+            caretRect = NSRect(x: prevRect.maxX, y: prevRect.minY, width: 2, height: max(18, prevRect.height))
+        } else if let linePos = textView.layoutManager.textLineForOffset(anchorOffset) {
+            caretRect = NSRect(x: textView.edgeInsets.left, y: linePos.yPos, width: 2, height: max(18, linePos.height))
+        } else {
+            caretRect = NSRect(x: textView.edgeInsets.left, y: scrollView.documentVisibleRect.origin.y + 8, width: 2, height: 18)
+        }
+
+        let bottomPoint = textView.convert(NSPoint(x: caretRect.minX, y: caretRect.maxY), to: self)
+        let topPoint = textView.convert(NSPoint(x: caretRect.minX, y: caretRect.minY), to: self)
+
+        let popupWidth: CGFloat = 340
+        let popupHeight = min(230, CGFloat(max(1, items.count)) * 27 + 10)
+        let x = max(8, min(bottomPoint.x, max(8, bounds.width - popupWidth - 8)))
+
+        // Container uses standard macOS bottom-left coordinates (isFlipped == false)
+        var y = bottomPoint.y - popupHeight - 4
+        if y < 8 {
+            y = topPoint.y + 4
+        }
+        y = max(8, min(y, max(8, bounds.height - popupHeight - 8)))
+
+        hosting.frame = NSRect(x: x, y: y, width: popupWidth, height: popupHeight)
+        hosting.isHidden = false
+        hosting.invalidateIntrinsicContentSize()
+        hosting.needsLayout = true
+        hosting.layoutSubtreeIfNeeded()
+    }
+
+    func dismissCompletion() {
+        completionTask?.cancel()
+        completionState.dismiss()
+        completionHostingView?.isHidden = true
+    }
+
+    private func acceptCompletion(_ item: LSPCompletionItem) {
+        let range = completionState.prefixRange
+        dismissCompletion()
+        guard let storage = textView.textStorage, range.max <= storage.length else { return }
+        isProgrammaticUpdate = true
+        textView.replaceCharacters(in: range, with: item.insertText)
+        let newLoc = min(storage.length, range.location + (item.insertText as NSString).length)
+        textView.selectionManager.setSelectedRange(NSRange(location: newLoc, length: 0))
+        isProgrammaticUpdate = false
+        workspace?.updateActiveTabContent(textView.string)
+        gutterView.needsDisplay = true
+        scheduleViewportHighlight(debounceMs: 0)
+        focusEditor()
+    }
+
+    func goToDefinition(atOffset offset: Int) {
+        guard let workspace,
+              let tab = workspace.activeTab,
+              let fileURL = tab.url,
+              let pos = lspPosition(for: offset) else {
+            return
+        }
+        let content = tab.content
+        let language = tab.language
+        let root = workspace.rootURL
+
+        Task { [weak workspace] in
+            let locations = await LSPManager.shared.requestDefinition(
+                url: fileURL,
+                language: language,
+                content: content,
+                line: pos.line,
+                character: pos.character,
+                workspaceRoot: root
+            )
+            await MainActor.run {
+                guard let workspace else { return }
+                guard let first = locations.first, let targetURL = URL(string: first.uri) else {
+                    workspace.statusMessage = L10n("lsp.definition.notFound")
+                    return
+                }
+                workspace.openFile(url: targetURL.standardized, atLine: first.range.start.line + 1)
+            }
+        }
+    }
 }
 
 // MARK: - SwiftUI Bridge
@@ -715,6 +1191,17 @@ struct HighPerformanceEditorRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> HighPerformanceEditorContainerView {
         let view = HighPerformanceEditorContainerView(workspace: workspace)
+        bindCallbacks(to: view)
+        view.syncWithTab(activeTab)
+        return view
+    }
+
+    func updateNSView(_ nsView: HighPerformanceEditorContainerView, context: Context) {
+        bindCallbacks(to: nsView)
+        nsView.syncWithTab(activeTab)
+    }
+
+    private func bindCallbacks(to view: HighPerformanceEditorContainerView) {
         workspace.onToggleCommentRequested = { [weak view] in
             view?.textView.toggleComment()
         }
@@ -724,21 +1211,29 @@ struct HighPerformanceEditorRepresentable: NSViewRepresentable {
         workspace.onFocusEditorRequested = { [weak view] in
             view?.focusEditor()
         }
-        view.syncWithTab(activeTab)
-        return view
-    }
-
-    func updateNSView(_ nsView: HighPerformanceEditorContainerView, context: Context) {
-        workspace.onToggleCommentRequested = { [weak nsView] in
-            nsView?.textView.toggleComment()
+        workspace.onRequestCompletionAction = { [weak view] in
+            view?.triggerCompletion(forceShow: true)
         }
-        workspace.onJumpToLineRequested = { [weak nsView] line in
-            nsView?.jumpToLine(line)
+        workspace.onGoToDefinitionAction = { [weak view] in
+            guard let view else { return }
+            let offset = view.textView.selectionManager.textSelections.first?.range.location ?? 0
+            view.goToDefinition(atOffset: offset)
         }
-        workspace.onFocusEditorRequested = { [weak nsView] in
-            nsView?.focusEditor()
+        workspace.onFindMatchesChanged = { [weak view] in
+            view?.applyOverlayAttributes()
         }
-        nsView.syncWithTab(activeTab)
+        workspace.onHighlightRangeRequested = { [weak view] range in
+            view?.highlightAndScroll(to: range)
+        }
+        workspace.onReplaceTextInActiveEditor = { [weak view] range, replacement in
+            view?.replaceRange(range, with: replacement)
+        }
+        workspace.onReplaceAllTextInActiveEditor = { [weak view] newText in
+            view?.replaceEntireDocument(with: newText)
+        }
+        workspace.onDiagnosticsUpdated = { [weak view] in
+            view?.refreshDiagnosticsOverlay()
+        }
     }
 
     func sizeThatFits(

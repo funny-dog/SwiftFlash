@@ -14,6 +14,7 @@ enum CodeLanguage: String, CaseIterable, Identifiable {
     case markdown = "Markdown"
     case shell = "Shell"
     case c = "C/C++"
+    case go = "Go"
     case yaml = "YAML"
     case toml = "TOML"
     case html = "HTML"
@@ -25,7 +26,7 @@ enum CodeLanguage: String, CaseIterable, Identifiable {
 
     var lineCommentPrefix: String? {
         switch self {
-        case .swift, .rust, .typescript, .javascript, .c, .css:
+        case .swift, .rust, .typescript, .javascript, .c, .css, .go:
             return "//"
         case .python, .shell, .yaml, .toml:
             return "#"
@@ -46,6 +47,7 @@ enum CodeLanguage: String, CaseIterable, Identifiable {
         case .markdown: return "doc.richtext"
         case .shell: return "terminal"
         case .c: return "cpu"
+        case .go: return "hare"
         case .yaml, .toml: return "list.bullet.rectangle"
         case .html, .css: return "globe"
         case .diff: return "plusminus"
@@ -64,6 +66,7 @@ enum CodeLanguage: String, CaseIterable, Identifiable {
         case .markdown: return NSColor(hex: 0x61AFEF)
         case .shell: return NSColor(hex: 0x98C379)
         case .c: return NSColor(hex: 0x56B6C2)
+        case .go: return NSColor(hex: 0x00ADD8)
         case .yaml, .toml: return NSColor(hex: 0xC678DD)
         case .html: return NSColor(hex: 0xE06C75)
         case .css: return NSColor(hex: 0x61AFEF)
@@ -79,12 +82,13 @@ enum CodeLanguage: String, CaseIterable, Identifiable {
         switch ext {
         case "rs": return .rust
         case "py", "pyi": return .python
-        case "ts", "tsx", "mts": return .typescript
-        case "js", "jsx", "mjs": return .javascript
+        case "ts", "tsx", "mts", "cts": return .typescript
+        case "js", "jsx", "mjs", "cjs": return .javascript
         case "json", "jsonc": return .json
         case "md", "markdown": return .markdown
         case "sh", "zsh", "bash": return .shell
-        case "c", "h", "cpp", "hpp", "cc", "m", "mm": return .c
+        case "c", "h", "cpp", "hpp", "cc", "cxx", "hh", "m", "mm": return .c
+        case "go": return .go
         case "yml", "yaml": return .yaml
         case "toml": return .toml
         case "html", "htm", "xml", "plist": return .html
@@ -160,7 +164,7 @@ struct EditorTab: Identifiable, Equatable {
     var cursorLine: Int = 1
     var cursorColumn: Int = 1
     var selectedRange: NSRange = NSRange(location: 0, length: 0)
-    var scrollOffsetY: CGFloat = 0
+    var scrollOffsetY: CGFloat? = nil
     var lastLoadTimeMs: Double = 0.0
     var pendingJumpLine: Int?
     var externalReloadRevision: Int = 0
@@ -354,6 +358,18 @@ final class WorkspaceState: ObservableObject {
     @Published var statusMessage: String = L10n("status.ready")
     @Published var lastRenderLatencyMs: Double = 0.0
 
+    // Find & Replace, Diagnostics, Bottom Panel & Task Runner
+    enum SettingsSection: String, CaseIterable {
+        case appearance
+        case languageServers
+    }
+
+    let findState = EditorFindState()
+    let taskRunner = TaskRunnerState()
+    @Published var bottomPanelTab: BottomPanelTab = .terminal
+    @Published var preferredSettingsSection: SettingsSection = .appearance
+    @Published var diagnosticsByFile: [String: [LSPDiagnostic]] = [:]
+
     // Callbacks handled by Editor Controller
     var onToggleCommentRequested: (() -> Void)?
     var onJumpToLineRequested: ((Int) -> Void)?
@@ -362,6 +378,14 @@ final class WorkspaceState: ObservableObject {
     var onToggleSidebarAction: (() -> Void)?
     var onSelectSidebarModeAction: ((SidebarMode) -> Void)?
     var onToggleTerminalAction: (() -> Void)?
+    var onShowBottomPanelAction: ((BottomPanelTab) -> Void)?
+    var onRequestCompletionAction: (() -> Void)?
+    var onGoToDefinitionAction: (() -> Void)?
+    var onFindMatchesChanged: (() -> Void)?
+    var onHighlightRangeRequested: ((NSRange) -> Void)?
+    var onReplaceTextInActiveEditor: ((NSRange, String) -> Void)?
+    var onReplaceAllTextInActiveEditor: ((String) -> Void)?
+    var onDiagnosticsUpdated: (() -> Void)?
 
     private var fileIndexTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
@@ -405,6 +429,23 @@ final class WorkspaceState: ObservableObject {
             self.rootItems = []
             self.allWorkspaceFiles = []
         }
+
+        if userDefaults === UserDefaults.standard {
+            LSPManager.shared.onDiagnosticsReceived = { [weak self] fileURL, diagnostics in
+                guard let self else { return }
+                let key = fileURL.standardized.path
+                if diagnostics.isEmpty {
+                    self.diagnosticsByFile.removeValue(forKey: key)
+                } else {
+                    self.diagnosticsByFile[key] = diagnostics
+                }
+                self.onDiagnosticsUpdated?()
+            }
+            LSPManager.shared.onServerBecameReady = { [weak self] in
+                self?.connectActiveTabToLSP()
+            }
+            LSPManager.shared.refreshStatuses()
+        }
     }
 
     private static func isExistingDirectory(_ url: URL) -> Bool {
@@ -413,6 +454,11 @@ final class WorkspaceState: ObservableObject {
     }
 
     // MARK: - Overlay Control
+
+    func openSettings(section: SettingsSection = .appearance) {
+        preferredSettingsSection = section
+        activeOverlay = .settings
+    }
 
     func toggleOverlay(_ mode: OverlayPanelMode) {
         if activeOverlay == mode {
@@ -481,6 +527,11 @@ final class WorkspaceState: ObservableObject {
                     activeTabID: activeTabID
                 )
             }
+            if userDefaults === UserDefaults.standard {
+                LSPManager.shared.shutdownAll()
+            }
+            diagnosticsByFile.removeAll()
+            taskRunner.stop()
             rootURL = target
 
             if let snapshot = projectSessions[target.path] {
@@ -504,6 +555,7 @@ final class WorkspaceState: ObservableObject {
         if openTabs.isEmpty {
             openInitialFiles()
         }
+        refreshTasksForCurrentContext()
         statusMessage = L10n("status.switchedToFormat", target.lastPathComponent)
         dismissOverlay()
     }
@@ -598,6 +650,7 @@ final class WorkspaceState: ObservableObject {
 
         detectGitBranch()
         rebuildFileIndex()
+        refreshTasksForCurrentContext()
     }
 
     private static func collectExpandedPaths(from items: [FileItem]) -> Set<String> {
@@ -1556,7 +1609,30 @@ final class WorkspaceState: ObservableObject {
         activeTabID = tab.id
         lastRenderLatencyMs = elapsedMs
         statusMessage = L10n("status.openedFileFormat", url.lastPathComponent, elapsedMs)
+        refreshTasksForCurrentContext()
+        connectTabToLSP(tab)
         onFocusEditorRequested?()
+    }
+
+    func connectActiveTabToLSP() {
+        guard let tab = activeTab else { return }
+        connectTabToLSP(tab)
+    }
+
+    func connectTabToLSP(_ tab: EditorTab) {
+        guard userDefaults === UserDefaults.standard,
+              let url = tab.url else { return }
+        let root = rootURL
+        let lang = tab.language
+        let content = tab.content
+        Task {
+            await LSPManager.shared.ensureSessionAndOpenDocument(
+                url: url,
+                language: lang,
+                content: content,
+                workspaceRoot: root
+            )
+        }
     }
 
     func createNewUntitledFile() {
@@ -1833,6 +1909,9 @@ final class WorkspaceState: ObservableObject {
             }
         }
 
+        if let tabURL = tab.url, userDefaults === UserDefaults.standard {
+            LSPManager.shared.notifyDocumentClosed(url: tabURL, language: tab.language, workspaceRoot: rootURL)
+        }
         openTabs.remove(at: index)
         if activeTabID == id {
             if openTabs.isEmpty {
@@ -1842,6 +1921,19 @@ final class WorkspaceState: ObservableObject {
                 activeTabID = openTabs[nextIdx].id
             }
         }
+        refreshTasksForCurrentContext()
+    }
+
+    func selectTab(id: UUID) {
+        activeTabID = id
+        refreshTasksForCurrentContext()
+        if let tab = activeTab {
+            connectTabToLSP(tab)
+        }
+        if findState.isFindBarVisible {
+            recomputeFindMatches()
+        }
+        onFocusEditorRequested?()
     }
 
     func closeActiveTab() {
@@ -1855,6 +1947,17 @@ final class WorkspaceState: ObservableObject {
               let idx = openTabs.firstIndex(where: { $0.id == activeTabID }) else { return }
         if openTabs[idx].content != newContent {
             openTabs[idx].content = newContent
+            if let url = openTabs[idx].url, userDefaults === UserDefaults.standard {
+                LSPManager.shared.notifyDocumentChanged(
+                    url: url,
+                    language: openTabs[idx].language,
+                    content: newContent,
+                    workspaceRoot: rootURL
+                )
+            }
+            if findState.isFindBarVisible {
+                recomputeFindMatches()
+            }
         }
     }
 
@@ -1901,6 +2004,14 @@ final class WorkspaceState: ObservableObject {
             openTabs[idx] = tab
             statusMessage = L10n("status.savedFileFormat", tab.title, elapsedMs)
             onSaveSuccessFlash?()
+            if userDefaults === UserDefaults.standard {
+                LSPManager.shared.notifyDocumentSaved(
+                    url: targetURL,
+                    language: tab.language,
+                    content: tab.content,
+                    workspaceRoot: rootURL
+                )
+            }
             reloadWorkspace()
             return true
         } catch {
@@ -1974,5 +2085,193 @@ final class WorkspaceState: ObservableObject {
             return String(url.path.dropFirst(rootPath.count + 1))
         }
         return url.path
+    }
+
+    // MARK: - In-File Find & Replace + Go to Line
+
+    func presentFindBar(replace: Bool) {
+        guard activeTab != nil else { return }
+        findState.isGoToLineVisible = false
+        findState.isFindBarVisible = true
+        if replace {
+            findState.isReplaceExpanded = true
+        }
+        if let tab = activeTab, tab.selectedRange.length > 0 {
+            let ns = tab.content as NSString
+            if tab.selectedRange.max <= ns.length {
+                let selected = ns.substring(with: tab.selectedRange)
+                if !selected.contains("\n"), !selected.isEmpty {
+                    findState.findQuery = selected
+                }
+            }
+        }
+        recomputeFindMatches()
+    }
+
+    func presentGoToLine() {
+        guard activeTab != nil else { return }
+        findState.isFindBarVisible = false
+        findState.isGoToLineVisible = true
+        findState.goToLineInput = ""
+    }
+
+    func closeFindAndGoToLine() {
+        findState.isFindBarVisible = false
+        findState.isGoToLineVisible = false
+        onFindMatchesChanged?()
+        onFocusEditorRequested?()
+    }
+
+    func recomputeFindMatches() {
+        guard let tab = activeTab else {
+            findState.matches = []
+            findState.currentMatchIndex = -1
+            onFindMatchesChanged?()
+            return
+        }
+        findState.recomputeMatches(in: tab.content, cursorLocation: tab.selectedRange.location)
+        onFindMatchesChanged?()
+    }
+
+    func findNextInActiveFile() {
+        guard let tab = activeTab else { return }
+        if findState.matches.isEmpty && !findState.findQuery.isEmpty {
+            recomputeFindMatches()
+        }
+        if let range = findState.stepMatch(forward: true, cursorLocation: tab.selectedRange.max) {
+            onHighlightRangeRequested?(range)
+            onFindMatchesChanged?()
+        }
+    }
+
+    func findPreviousInActiveFile() {
+        guard let tab = activeTab else { return }
+        if findState.matches.isEmpty && !findState.findQuery.isEmpty {
+            recomputeFindMatches()
+        }
+        if let range = findState.stepMatch(forward: false, cursorLocation: tab.selectedRange.location) {
+            onHighlightRangeRequested?(range)
+            onFindMatchesChanged?()
+        }
+    }
+
+    func replaceCurrentInActiveFile() {
+        guard let tab = activeTab, tab.virtualKey == nil, !findState.matches.isEmpty else { return }
+        let idx = (findState.currentMatchIndex >= 0 && findState.currentMatchIndex < findState.matches.count)
+            ? findState.currentMatchIndex
+            : 0
+        let targetRange = findState.matches[idx]
+        onReplaceTextInActiveEditor?(targetRange, findState.replaceQuery)
+        recomputeFindMatches()
+        if let nextRange = findState.matches.indices.contains(findState.currentMatchIndex)
+            ? findState.matches[findState.currentMatchIndex]
+            : findState.matches.first {
+            onHighlightRangeRequested?(nextRange)
+        }
+    }
+
+    func replaceAllInActiveFile() {
+        guard let tab = activeTab, tab.virtualKey == nil, !findState.findQuery.isEmpty else { return }
+        let result = EditorFindEngine.replaceAll(
+            in: tab.content,
+            query: findState.findQuery,
+            replacement: findState.replaceQuery,
+            isCaseSensitive: findState.isCaseSensitive,
+            isRegex: findState.isRegex
+        )
+        guard result.count > 0 else { return }
+        onReplaceAllTextInActiveEditor?(result.updatedText)
+        recomputeFindMatches()
+        statusMessage = L10n("find.replacedAllCountFormat", result.count)
+    }
+
+    func commitGoToLine() {
+        let trimmed = findState.goToLineInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let line = Int(trimmed), line > 0 {
+            onJumpToLineRequested?(line)
+        }
+        findState.isGoToLineVisible = false
+        onFocusEditorRequested?()
+    }
+
+    // MARK: - Diagnostics & Task Runner Helpers
+
+    var diagnosticsForActiveTab: [LSPDiagnostic] {
+        guard let url = activeTab?.url else { return [] }
+        return diagnosticsByFile[url.standardized.path] ?? []
+    }
+
+    var allDiagnosticEntries: [WorkspaceDiagnosticEntry] {
+        var entries: [WorkspaceDiagnosticEntry] = []
+        for (path, list) in diagnosticsByFile {
+            let url = URL(fileURLWithPath: path)
+            let rel = relativePath(for: url)
+            for diag in list {
+                entries.append(WorkspaceDiagnosticEntry(fileURL: url, relativePath: rel, diagnostic: diag))
+            }
+        }
+        return entries.sorted { lhs, rhs in
+            if lhs.diagnostic.severity.rawValue != rhs.diagnostic.severity.rawValue {
+                return lhs.diagnostic.severity.rawValue < rhs.diagnostic.severity.rawValue
+            }
+            if lhs.relativePath != rhs.relativePath {
+                return lhs.relativePath < rhs.relativePath
+            }
+            return lhs.diagnostic.range.start.line < rhs.diagnostic.range.start.line
+        }
+    }
+
+    var totalErrorCount: Int {
+        diagnosticsByFile.values.reduce(0) { acc, list in
+            acc + list.filter { $0.severity == .error }.count
+        }
+    }
+
+    var totalWarningCount: Int {
+        diagnosticsByFile.values.reduce(0) { acc, list in
+            acc + list.filter { $0.severity == .warning }.count
+        }
+    }
+
+    func showBottomPanel(_ tab: BottomPanelTab) {
+        bottomPanelTab = tab
+        onShowBottomPanelAction?(tab)
+    }
+
+    func refreshTasksForCurrentContext() {
+        taskRunner.refreshTasks(in: rootURL, activeFileURL: activeTab?.url, hasWorkspaceOpen: hasWorkspaceOpen)
+    }
+
+    func runTask(_ task: ProjectTask) {
+        guard hasWorkspaceOpen else { return }
+        if activeTab?.isDirty == true {
+            _ = saveActiveTab()
+        }
+        showBottomPanel(.run)
+        taskRunner.run(task: task, in: rootURL)
+    }
+
+    func runDefaultRunTask() {
+        guard hasWorkspaceOpen else { return }
+        refreshTasksForCurrentContext()
+        if activeTab?.isDirty == true {
+            _ = saveActiveTab()
+        }
+        showBottomPanel(.run)
+        taskRunner.runDefault(kind: .run, in: rootURL, activeFileURL: activeTab?.url)
+    }
+
+    func runDefaultTestTask() {
+        guard hasWorkspaceOpen else { return }
+        refreshTasksForCurrentContext()
+        if activeTab?.isDirty == true {
+            _ = saveActiveTab()
+        }
+        showBottomPanel(.run)
+        taskRunner.runDefault(kind: .test, in: rootURL, activeFileURL: activeTab?.url)
+    }
+
+    func stopRunningTask() {
+        taskRunner.stop()
     }
 }

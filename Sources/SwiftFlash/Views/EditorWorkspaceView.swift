@@ -2,7 +2,13 @@ import SwiftUI
 
 struct EditorWorkspaceView: View {
     @ObservedObject var workspace: WorkspaceState
+    @ObservedObject private var findState: EditorFindState
     @ObservedObject private var themeManager = ThemeManager.shared
+
+    init(workspace: WorkspaceState) {
+        self.workspace = workspace
+        self.findState = workspace.findState
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,6 +18,11 @@ struct EditorWorkspaceView: View {
             if let activeTab = workspace.activeTab {
                 breadcrumbBar(for: activeTab)
                     .layoutPriority(1)
+
+                if findState.isFindBarVisible || findState.isGoToLineVisible {
+                    EditorFindBarView(workspace: workspace, findState: findState)
+                        .layoutPriority(1)
+                }
 
                 HighPerformanceEditorRepresentable(workspace: workspace, activeTab: activeTab)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -31,8 +42,7 @@ struct EditorWorkspaceView: View {
                         tab: tab,
                         isActive: tab.id == workspace.activeTabID,
                         onSelect: {
-                            workspace.activeTabID = tab.id
-                            workspace.onFocusEditorRequested?()
+                            workspace.selectTab(id: tab.id)
                         },
                         onClose: {
                             workspace.closeTab(id: tab.id)

@@ -2,7 +2,14 @@ import SwiftUI
 
 struct StatusBarView: View {
     @ObservedObject var workspace: WorkspaceState
+    @ObservedObject private var taskRunner: TaskRunnerState
     @ObservedObject private var themeManager = ThemeManager.shared
+    @ObservedObject private var lspManager = LSPManager.shared
+
+    init(workspace: WorkspaceState) {
+        self.workspace = workspace
+        self.taskRunner = workspace.taskRunner
+    }
 
     private var isExplorerActive: Bool {
         workspace.isSidebarVisible && workspace.sidebarMode == .explorer
@@ -72,6 +79,31 @@ struct StatusBarView: View {
             }
             .buttonStyle(.plain)
             .help(L10n("header.branch.help"))
+
+            Button {
+                workspace.showBottomPanel(.problems)
+            } label: {
+                HStack(spacing: 6) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "xmark.circle")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(nsColor: workspace.totalErrorCount > 0 ? NSColor(hex: 0xE06C75) : ZedTheme.mutedText))
+                        Text("\(workspace.totalErrorCount)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(Color(nsColor: workspace.totalErrorCount > 0 ? ZedTheme.primaryText : ZedTheme.mutedText))
+                    }
+                    HStack(spacing: 3) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(nsColor: workspace.totalWarningCount > 0 ? NSColor(hex: 0xE5C07B) : ZedTheme.mutedText))
+                        Text("\(workspace.totalWarningCount)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(Color(nsColor: workspace.totalWarningCount > 0 ? ZedTheme.primaryText : ZedTheme.mutedText))
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .help(L10n("statusbar.problemsHelp"))
 
             HStack(spacing: 5) {
                 Circle()
@@ -144,6 +176,10 @@ struct StatusBarView: View {
                 Text(tab.language.rawValue)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color(nsColor: tab.language.iconColor))
+
+                if let matchedLSP = lspManager.serverDefinition(for: tab.language, url: tab.url) {
+                    lspStatusPill(for: matchedLSP)
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -154,6 +190,54 @@ struct StatusBarView: View {
                 .fill(Color(nsColor: ZedTheme.border))
                 .frame(height: 1)
         }
+    }
+
+    @ViewBuilder
+    private func lspStatusPill(for def: LSPServerDefinition) -> some View {
+        let status = lspManager.status(for: def.id)
+        let isRunning = lspManager.activeServerIDs.contains(def.id)
+
+        let dotColor: NSColor = {
+            if isRunning { return ZedTheme.string }
+            switch status {
+            case .detected, .installed: return ZedTheme.function
+            case .installing: return ZedTheme.typeName
+            case .failed: return ZedTheme.attribute
+            case .notInstalled: return ZedTheme.mutedText
+            }
+        }()
+
+        let labelText: String = {
+            if case .installing(let progress) = status, let fraction = progress.fraction {
+                return "\(def.displayName) \(Int((fraction * 100).rounded()))%"
+            }
+            return def.displayName
+        }()
+
+        Button {
+            workspace.openSettings(section: .languageServers)
+        } label: {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(Color(nsColor: dotColor))
+                    .frame(width: 6, height: 6)
+                Text(labelText)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(Color(nsColor: isRunning || status.isReady ? ZedTheme.primaryText : ZedTheme.mutedText))
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color(nsColor: ZedTheme.background).opacity(0.75))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color(nsColor: ZedTheme.border), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(L10n("statusbar.lsp.help"))
     }
 
     private func dockButton<Icon: View>(
