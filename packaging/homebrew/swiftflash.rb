@@ -4,7 +4,7 @@ cask "swiftflash" do
 
   url "https://github.com/funny-dog/SwiftFlash/releases/download/v#{version}/SwiftFlash-v#{version}.zip"
   name "SwiftFlash"
-  desc "Fast native macOS code editor built with Swift, AppKit, and CoreText"
+  desc "Fast native code editor built with Swift, AppKit, and CoreText"
   homepage "https://github.com/funny-dog/SwiftFlash"
 
   depends_on arch: :arm64
