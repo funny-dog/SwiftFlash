@@ -1,0 +1,27 @@
+name: CI
+
+# 日常功能在推送前跑本地 CI，远端 CI 仅在发版打 Tag (v*)、Pull Request 或手动分发时运行。
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: 工具链版本
+        run: swift --version
+      - name: 运行完整 CI 检查
+        run: bash scripts/ci.sh
