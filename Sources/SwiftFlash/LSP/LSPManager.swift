@@ -10,6 +10,7 @@ enum LSPStorage {
         return appSupport
             .appendingPathComponent("SwiftFlash", isDirectory: true)
             .appendingPathComponent("LSP", isDirectory: true)
+            .standardizedFileURL
     }
 
     static func serverDirectory(id: String) -> URL {
@@ -29,25 +30,24 @@ final class LSPManager: ObservableObject {
     @Published var lastErrorMessage: String?
 
     private var sessions: [String: LSPServerConnection] = [:]
-    private var startingKeys: Set<String> = []
-    private var openDocumentVersions: [String: Int] = [:]
+    private var startingTasks: [String: Task<LSPServerConnection?, Never>] = [:]
+
+    /// Per-session document version & last synced content maps so terminating one LSP
+    /// never corrupts version tracking of other active language servers.
+    private var openDocumentVersionsBySession: [String: [String: Int]] = [:]
+    private var lastSentDocumentContentsBySession: [String: [String: String]] = [:]
     private var latestDocumentContents: [String: String] = [:]
-    private var lastSentDocumentContents: [String: String] = [:]
-    private var customPaths: [String: String] = [:]
+    private var pendingChangeTasks: [String: Task<Void, Never>] = [:]
+
     private var hasScannedInitialStatuses = false
     private var refreshTask: Task<Void, Never>?
 
     var onDiagnosticsReceived: ((URL, [LSPDiagnostic]) -> Void)?
     var onServerBecameReady: (() -> Void)?
 
-    private static let customPathsDefaultsKey = "swiftflash.lsp.customPaths"
-
     private init() {
         // Keep singleton initialization side-effect free so Swift Concurrency tasks
         // on MainActor never re-enter dispatch_once while subprocesses pump RunLoop.
-        if let saved = UserDefaults.standard.dictionary(forKey: Self.customPathsDefaultsKey) as? [String: String] {
-            customPaths = saved
-        }
     }
 
     // MARK: - Server Discovery & Status
@@ -69,13 +69,12 @@ final class LSPManager: ObservableObject {
             return
         }
 
-        let snapshotCustomPaths = customPaths
         isScanningStatuses = true
 
         let task = Task<Void, Never> { [weak self] in
             let probed = await Task.detached(priority: .utility) {
                 try? FileManager.default.createDirectory(at: LSPStorage.rootDirectory, withIntermediateDirectories: true)
-                return Self.probeAllStatuses(customPaths: snapshotCustomPaths)
+                return Self.probeAllStatuses()
             }.value
 
             guard let self else { return }
@@ -106,21 +105,6 @@ final class LSPManager: ObservableObject {
         statuses[serverID] ?? .notInstalled
     }
 
-    func setCustomExecutablePath(_ path: String, for serverID: String) {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            customPaths.removeValue(forKey: serverID)
-        } else {
-            customPaths[serverID] = trimmed
-        }
-        UserDefaults.standard.set(customPaths, forKey: Self.customPathsDefaultsKey)
-        refreshStatuses()
-    }
-
-    func customExecutablePath(for serverID: String) -> String {
-        customPaths[serverID] ?? ""
-    }
-
     func serverDefinition(for language: CodeLanguage, url: URL? = nil) -> LSPServerDefinition? {
         switch language {
         case .swift:
@@ -132,7 +116,6 @@ final class LSPManager: ObservableObject {
             if let clangdDef, status(for: clangdDef.id).isReady {
                 return clangdDef
             }
-            // Fallback to SourceKit-LSP on macOS when Xcode tools are present and clangd isn't installed.
             if let sourcekitDef = LSPServerCatalog.definition(forID: "sourcekit-lsp"),
                status(for: sourcekitDef.id).isReady {
                 return sourcekitDef
@@ -206,15 +189,19 @@ final class LSPManager: ObservableObject {
                 guard let url = URL(string: urlString) else {
                     throw URLError(.badURL)
                 }
-                updateInstallProgress(id: id, message: L10n("lsp.status.downloading"), fraction: 0.0, detail: nil)
                 let downloadMsg = L10n("lsp.status.downloading")
-                let data = try await Self.downloadData(from: url) { [weak self] fraction, detail in
+                updateInstallProgress(id: id, message: downloadMsg, fraction: 0.0, detail: nil)
+                let downloadedFile = try await Self.downloadToTempFile(from: url) { [weak self] fraction, detail in
                     Task { @MainActor [weak self] in
                         self?.updateInstallProgress(id: id, message: downloadMsg, fraction: fraction, detail: detail)
                     }
                 }
+                defer { try? FileManager.default.removeItem(at: downloadedFile) }
+
                 if let expectedSHA, !expectedSHA.isEmpty {
-                    let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                    let actual = try await Task.detached(priority: .userInitiated) {
+                        try Self.sha256Hex(ofFileAt: downloadedFile)
+                    }.value
                     guard actual.lowercased() == expectedSHA.lowercased() else {
                         throw NSError(
                             domain: "SwiftFlashLSP",
@@ -223,10 +210,11 @@ final class LSPManager: ObservableObject {
                         )
                     }
                 }
+
                 updateInstallProgress(id: id, message: L10n("lsp.status.extracting"), fraction: 1.0, detail: nil)
                 let destBinary = dir.appendingPathComponent(def.executableName)
                 try await Task.detached(priority: .userInitiated) {
-                    try Self.extractGzipBinary(data: data, to: destBinary)
+                    try Self.extractGzipBinary(fromFile: downloadedFile, to: destBinary)
                 }.value
                 statuses[id] = .installed(path: destBinary.path)
 
@@ -239,16 +227,18 @@ final class LSPManager: ObservableObject {
                 )
                 let downloadMsg = L10n("lsp.status.downloading")
                 updateInstallProgress(id: id, message: downloadMsg, fraction: 0.0, detail: nil)
-                let zipData = try await Self.downloadData(from: downloadURL) { [weak self] fraction, detail in
+                let downloadedZip = try await Self.downloadToTempFile(from: downloadURL) { [weak self] fraction, detail in
                     Task { @MainActor [weak self] in
                         self?.updateInstallProgress(id: id, message: downloadMsg, fraction: fraction, detail: detail)
                     }
                 }
+                defer { try? FileManager.default.removeItem(at: downloadedZip) }
+
                 updateInstallProgress(id: id, message: L10n("lsp.status.extracting"), fraction: 1.0, detail: nil)
-                let extractedRoot = try await Task.detached(priority: .userInitiated) {
-                    try Self.extractZipArchive(data: zipData, into: dir, expectedRelativeBinary: binaryRelativePath)
+                let extractedBinary = try await Task.detached(priority: .userInitiated) {
+                    try Self.extractZipArchive(fromFile: downloadedZip, into: dir, expectedRelativeBinary: binaryRelativePath)
                 }.value
-                statuses[id] = .installed(path: extractedRoot.path)
+                statuses[id] = .installed(path: extractedBinary.path)
 
             case .npmPackages(let packages, let binaryName):
                 guard let npmPath = Self.findExecutableInCommonPaths("npm") else {
@@ -317,8 +307,8 @@ final class LSPManager: ObservableObject {
         content: String,
         workspaceRoot: URL
     ) async {
-        let key = documentKey(url: url)
-        latestDocumentContents[key] = content
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
 
         await ensureStatusesScanned()
         guard let def = serverDefinition(for: language, url: url),
@@ -327,17 +317,14 @@ final class LSPManager: ObservableObject {
             return
         }
 
-        let currentText = latestDocumentContents[key] ?? content
-        if openDocumentVersions[key] == nil {
-            openDocumentVersions[key] = 1
-            lastSentDocumentContents[key] = currentText
-            conn.didOpen(url: url, languageID: lspLangID, version: 1, text: currentText)
-        } else if lastSentDocumentContents[key] != currentText {
-            let nextVer = (openDocumentVersions[key] ?? 0) + 1
-            openDocumentVersions[key] = nextVer
-            lastSentDocumentContents[key] = currentText
-            conn.didChange(url: url, version: nextVer, text: currentText)
-        }
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        syncDocumentImmediately(
+            sessionKey: sKey,
+            connection: conn,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content
+        )
     }
 
     func notifyDocumentChanged(
@@ -349,17 +336,28 @@ final class LSPManager: ObservableObject {
         let dKey = documentKey(url: url)
         latestDocumentContents[dKey] = content
 
-        guard let def = serverDefinition(for: language, url: url) else { return }
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url) else {
+            return
+        }
         let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
-        guard let conn = sessions[sKey], conn.isInitialized else { return }
+        guard sessions[sKey]?.isInitialized == true else { return }
 
-        let nextVer = (openDocumentVersions[dKey] ?? 0) + 1
-        openDocumentVersions[dKey] = nextVer
-        lastSentDocumentContents[dKey] = content
-        if nextVer == 1, let lspLangID = lspLanguageID(for: language, url: url) {
-            conn.didOpen(url: url, languageID: lspLangID, version: 1, text: content)
-        } else {
-            conn.didChange(url: url, version: nextVer, text: content)
+        let taskKey = "\(sKey)::\(dKey)"
+        pendingChangeTasks[taskKey]?.cancel()
+        pendingChangeTasks[taskKey] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.pendingChangeTasks.removeValue(forKey: taskKey)
+            guard let conn = self.sessions[sKey], conn.isInitialized,
+                  let currentText = self.latestDocumentContents[dKey] else { return }
+            self.syncDocumentImmediately(
+                sessionKey: sKey,
+                connection: conn,
+                url: url,
+                languageID: lspLangID,
+                content: currentText
+            )
         }
     }
 
@@ -369,20 +367,31 @@ final class LSPManager: ObservableObject {
         content: String,
         workspaceRoot: URL
     ) {
-        guard let def = serverDefinition(for: language, url: url) else { return }
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url) else { return }
         let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
         guard let conn = sessions[sKey], conn.isInitialized else { return }
+
+        flushPendingChange(sessionKey: sKey, url: url, languageID: lspLangID, content: content, connection: conn)
         conn.didSave(url: url, text: content)
     }
 
     func notifyDocumentClosed(url: URL, language: CodeLanguage, workspaceRoot: URL) {
         let dKey = documentKey(url: url)
-        openDocumentVersions.removeValue(forKey: dKey)
         latestDocumentContents.removeValue(forKey: dKey)
-        lastSentDocumentContents.removeValue(forKey: dKey)
-        guard let def = serverDefinition(for: language, url: url) else { return }
-        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
-        sessions[sKey]?.didClose(url: url)
+        for (sKey, conn) in sessions {
+            let taskKey = "\(sKey)::\(dKey)"
+            pendingChangeTasks[taskKey]?.cancel()
+            pendingChangeTasks.removeValue(forKey: taskKey)
+
+            if openDocumentVersionsBySession[sKey]?.removeValue(forKey: dKey) != nil {
+                lastSentDocumentContentsBySession[sKey]?.removeValue(forKey: dKey)
+                conn.didClose(url: url)
+            }
+        }
     }
 
     func requestCompletions(
@@ -393,11 +402,24 @@ final class LSPManager: ObservableObject {
         character: Int,
         workspaceRoot: URL
     ) async -> [LSPCompletionItem]? {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
         guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
               let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
             return nil
         }
-        await ensureSessionAndOpenDocument(url: url, language: language, content: content, workspaceRoot: workspaceRoot)
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
         return try? await conn.completion(url: url, line: line, character: character)
     }
 
@@ -409,31 +431,116 @@ final class LSPManager: ObservableObject {
         character: Int,
         workspaceRoot: URL
     ) async -> [LSPLocation] {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
         guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
               let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
             return []
         }
-        await ensureSessionAndOpenDocument(url: url, language: language, content: content, workspaceRoot: workspaceRoot)
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
         return (try? await conn.definition(url: url, line: line, character: character)) ?? []
     }
 
     func shutdownAll() {
+        for (_, task) in pendingChangeTasks {
+            task.cancel()
+        }
+        pendingChangeTasks.removeAll()
+        for (_, task) in startingTasks {
+            task.cancel()
+        }
+        startingTasks.removeAll()
         for (_, conn) in sessions {
             conn.shutdownNow()
         }
         sessions.removeAll()
-        openDocumentVersions.removeAll()
-        lastSentDocumentContents.removeAll()
+        openDocumentVersionsBySession.removeAll()
+        lastSentDocumentContentsBySession.removeAll()
+        latestDocumentContents.removeAll()
         activeServerIDs.removeAll()
     }
 
     private func shutdownSessions(forServerID serverID: String) {
-        let keysToRemove = sessions.keys.filter { $0.hasPrefix(serverID + "::") }
+        let prefix = serverID + "::"
+        let keysToRemove = sessions.keys.filter { $0.hasPrefix(prefix) }
         for key in keysToRemove {
             sessions[key]?.shutdownNow()
-            sessions.removeValue(forKey: key)
+            clearSessionState(forSessionKey: key)
+        }
+        for key in startingTasks.keys where key.hasPrefix(prefix) {
+            startingTasks[key]?.cancel()
+            startingTasks.removeValue(forKey: key)
         }
         activeServerIDs = Set(sessions.values.map(\.serverID))
+    }
+
+    private func clearSessionState(forSessionKey sKey: String) {
+        sessions.removeValue(forKey: sKey)
+        openDocumentVersionsBySession.removeValue(forKey: sKey)
+        lastSentDocumentContentsBySession.removeValue(forKey: sKey)
+        let pendingPrefix = sKey + "::"
+        for taskKey in pendingChangeTasks.keys where taskKey.hasPrefix(pendingPrefix) {
+            pendingChangeTasks[taskKey]?.cancel()
+            pendingChangeTasks.removeValue(forKey: taskKey)
+        }
+    }
+
+    private func flushPendingChange(
+        sessionKey sKey: String,
+        url: URL,
+        languageID: String,
+        content: String,
+        connection conn: LSPServerConnection
+    ) {
+        let dKey = documentKey(url: url)
+        let taskKey = "\(sKey)::\(dKey)"
+        pendingChangeTasks[taskKey]?.cancel()
+        pendingChangeTasks.removeValue(forKey: taskKey)
+        syncDocumentImmediately(
+            sessionKey: sKey,
+            connection: conn,
+            url: url,
+            languageID: languageID,
+            content: content
+        )
+    }
+
+    private func syncDocumentImmediately(
+        sessionKey sKey: String,
+        connection conn: LSPServerConnection,
+        url: URL,
+        languageID: String,
+        content: String
+    ) {
+        let dKey = documentKey(url: url)
+        var versions = openDocumentVersionsBySession[sKey] ?? [:]
+        var sentContents = lastSentDocumentContentsBySession[sKey] ?? [:]
+
+        if versions[dKey] == nil {
+            versions[dKey] = 1
+            sentContents[dKey] = content
+            openDocumentVersionsBySession[sKey] = versions
+            lastSentDocumentContentsBySession[sKey] = sentContents
+            conn.didOpen(url: url, languageID: languageID, version: 1, text: content)
+        } else if sentContents[dKey] != content {
+            let nextVer = (versions[dKey] ?? 0) + 1
+            versions[dKey] = nextVer
+            sentContents[dKey] = content
+            openDocumentVersionsBySession[sKey] = versions
+            lastSentDocumentContentsBySession[sKey] = sentContents
+            conn.didChange(url: url, version: nextVer, text: content)
+        }
     }
 
     private func connection(for def: LSPServerDefinition, workspaceRoot: URL) async -> LSPServerConnection? {
@@ -441,8 +548,8 @@ final class LSPManager: ObservableObject {
         if let existing = sessions[key], existing.isInitialized {
             return existing
         }
-        if startingKeys.contains(key) {
-            return nil
+        if let inFlight = startingTasks[key] {
+            return await inFlight.value
         }
 
         await ensureStatusesScanned()
@@ -450,37 +557,45 @@ final class LSPManager: ObservableObject {
             return nil
         }
 
-        startingKeys.insert(key)
-        defer { startingKeys.remove(key) }
-
-        do {
-            let conn = try LSPServerConnection(
-                serverID: def.id,
-                executablePath: executablePath,
-                arguments: def.arguments,
-                workspaceRoot: workspaceRoot
-            )
-            conn.onDiagnostics = { [weak self] uriString, diagnostics in
-                guard let fileURL = URL(string: uriString) else { return }
-                Task { @MainActor [weak self] in
-                    self?.onDiagnosticsReceived?(fileURL.standardized, diagnostics)
+        let startTask = Task<LSPServerConnection?, Never> { [weak self] in
+            guard let self else { return nil }
+            do {
+                let conn = try LSPServerConnection(
+                    serverID: def.id,
+                    executablePath: executablePath,
+                    arguments: def.arguments,
+                    workspaceRoot: workspaceRoot
+                )
+                conn.onDiagnostics = { [weak self] uriString, diagnostics in
+                    guard let fileURL = URL(string: uriString) else { return }
+                    Task { @MainActor [weak self] in
+                        self?.onDiagnosticsReceived?(fileURL.standardized, diagnostics)
+                    }
                 }
-            }
-            conn.onTerminated = { [weak self] in
-                Task { @MainActor [weak self] in
-                    self?.sessions.removeValue(forKey: key)
-                    self?.openDocumentVersions.removeAll()
-                    self?.lastSentDocumentContents.removeAll()
-                    self?.activeServerIDs = Set(self?.sessions.values.map(\.serverID) ?? [])
+                conn.onTerminated = { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.clearSessionState(forSessionKey: key)
+                        self.activeServerIDs = Set(self.sessions.values.map(\.serverID))
+                    }
                 }
+                try await conn.initialize()
+                guard !Task.isCancelled else {
+                    conn.shutdownNow()
+                    return nil
+                }
+                self.sessions[key] = conn
+                self.activeServerIDs.insert(def.id)
+                return conn
+            } catch {
+                return nil
             }
-            try await conn.initialize()
-            sessions[key] = conn
-            activeServerIDs.insert(def.id)
-            return conn
-        } catch {
-            return nil
         }
+
+        startingTasks[key] = startTask
+        let result = await startTask.value
+        startingTasks.removeValue(forKey: key)
+        return result
     }
 
     private func sessionKey(serverID: String, workspaceRoot: URL) -> String {
@@ -493,12 +608,12 @@ final class LSPManager: ObservableObject {
 
     // MARK: - Executable Resolution Helpers
 
-    private nonisolated static func probeAllStatuses(customPaths: [String: String]) -> [String: LSPServerStatus] {
+    private nonisolated static func probeAllStatuses() -> [String: LSPServerStatus] {
         var result: [String: LSPServerStatus] = [:]
         for def in LSPServerCatalog.all {
             if let installedPath = findManagedExecutable(for: def) {
                 result[def.id] = .installed(path: installedPath)
-            } else if let detectedPath = findSystemExecutable(for: def, customPaths: customPaths) {
+            } else if let detectedPath = findSystemExecutable(for: def) {
                 result[def.id] = .detected(path: detectedPath)
             } else {
                 result[def.id] = .notInstalled
@@ -526,14 +641,7 @@ final class LSPManager: ObservableObject {
         return nil
     }
 
-    private nonisolated static func findSystemExecutable(
-        for def: LSPServerDefinition,
-        customPaths: [String: String]
-    ) -> String? {
-        let fm = FileManager.default
-        if let custom = customPaths[def.id], !custom.isEmpty, fm.isExecutableFile(atPath: custom) {
-            return custom
-        }
+    private nonisolated static func findSystemExecutable(for def: LSPServerDefinition) -> String? {
         if case .systemToolchain(let xcrunTool) = def.installStrategy,
            let xcrunPath = Self.resolveViaXcrun(xcrunTool) {
             return xcrunPath
@@ -542,18 +650,14 @@ final class LSPManager: ObservableObject {
     }
 
     private nonisolated static func resolveViaXcrun(_ tool: String) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        proc.arguments = ["--find", tool]
-        let out = Pipe()
-        proc.standardOutput = out
-        proc.standardError = Pipe()
-        guard (try? proc.run()) != nil else { return nil }
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else { return nil }
-        let path = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let path, !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) {
+        let res = ProcessRunner.run(
+            executablePath: "/usr/bin/xcrun",
+            arguments: ["--find", tool],
+            timeoutSeconds: 8
+        )
+        guard res.exitCode == 0 else { return nil }
+        let path = res.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
         return nil
@@ -561,21 +665,7 @@ final class LSPManager: ObservableObject {
 
     nonisolated static func findExecutableInCommonPaths(_ name: String) -> String? {
         let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser.path
-        var searchDirs: [String] = []
-        if let envPath = ProcessInfo.processInfo.environment["PATH"] {
-            searchDirs.append(contentsOf: envPath.split(separator: ":").map(String.init))
-        }
-        searchDirs.append(contentsOf: [
-            "/opt/homebrew/bin",
-            "/opt/homebrew/opt/llvm/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "\(home)/.cargo/bin",
-            "\(home)/go/bin",
-            "\(home)/.local/bin"
-        ])
-        for dir in searchDirs {
+        for dir in ToolchainEnvironment.searchDirectories() {
             let candidate = URL(fileURLWithPath: dir).appendingPathComponent(name).path
             if fm.isExecutableFile(atPath: candidate) {
                 return candidate
@@ -584,20 +674,32 @@ final class LSPManager: ObservableObject {
         return nil
     }
 
-    // MARK: - Download & Archive Extraction Helpers
+    // MARK: - Zero-Copy Download & Archive Extraction Helpers
 
     private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        private let lock = NSLock()
         private let onProgress: @Sendable (Double?, String) -> Void
-        private let continuation: CheckedContinuation<Data, Error>
+        private let continuation: CheckedContinuation<URL, Error>
         private var didResume = false
         private var lastUpdateTime: CFAbsoluteTime = 0
 
         init(
             onProgress: @escaping @Sendable (Double?, String) -> Void,
-            continuation: CheckedContinuation<Data, Error>
+            continuation: CheckedContinuation<URL, Error>
         ) {
             self.onProgress = onProgress
             self.continuation = continuation
+        }
+
+        private func resumeOnce(_ result: Result<URL, Error>) {
+            lock.lock()
+            guard !didResume else {
+                lock.unlock()
+                return
+            }
+            didResume = true
+            lock.unlock()
+            continuation.resume(with: result)
         }
 
         func urlSession(
@@ -608,8 +710,13 @@ final class LSPManager: ObservableObject {
             totalBytesExpectedToWrite: Int64
         ) {
             let now = CFAbsoluteTimeGetCurrent()
-            guard now - lastUpdateTime >= 0.08 || totalBytesWritten == totalBytesExpectedToWrite else { return }
-            lastUpdateTime = now
+            lock.lock()
+            let shouldEmit = (now - lastUpdateTime >= 0.08) || totalBytesWritten == totalBytesExpectedToWrite
+            if shouldEmit {
+                lastUpdateTime = now
+            }
+            lock.unlock()
+            guard shouldEmit else { return }
 
             let writtenStr = ByteCountFormatter.string(fromByteCount: totalBytesWritten, countStyle: .file)
             if totalBytesExpectedToWrite > 0 {
@@ -623,37 +730,38 @@ final class LSPManager: ObservableObject {
         }
 
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-            guard !didResume else { return }
             if let http = downloadTask.response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                didResume = true
-                continuation.resume(throwing: NSError(
+                resumeOnce(.failure(NSError(
                     domain: "SwiftFlashLSP",
                     code: http.statusCode,
                     userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]
-                ))
+                )))
                 return
             }
+            let tempFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("swiftflash-dl-\(UUID().uuidString)")
             do {
-                let data = try Data(contentsOf: location)
-                didResume = true
-                continuation.resume(returning: data)
+                try FileManager.default.moveItem(at: location, to: tempFile)
+                resumeOnce(.success(tempFile))
             } catch {
-                didResume = true
-                continuation.resume(throwing: error)
+                resumeOnce(.failure(error))
             }
         }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            guard !didResume, let error else { return }
-            didResume = true
-            continuation.resume(throwing: error)
+            if let error {
+                resumeOnce(.failure(error))
+            } else {
+                // Safeguard against unexpected completion without didFinishDownloadingTo.
+                resumeOnce(.failure(URLError(.unknown)))
+            }
         }
     }
 
-    private nonisolated static func downloadData(
+    private nonisolated static func downloadToTempFile(
         from url: URL,
         onProgress: @escaping @Sendable (Double?, String) -> Void
-    ) async throws -> Data {
+    ) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             let delegate = DownloadProgressDelegate(onProgress: onProgress, continuation: continuation)
             let config = URLSessionConfiguration.ephemeral
@@ -665,6 +773,18 @@ final class LSPManager: ObservableObject {
             task.resume()
             session.finishTasksAndInvalidate()
         }
+    }
+
+    private nonisolated static func sha256Hex(ofFileAt url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private nonisolated static func resolveLatestGitHubAssetURL(repo: String, prefix: String, suffix: String) async throws -> URL {
@@ -701,50 +821,51 @@ final class LSPManager: ObservableObject {
         )
     }
 
-    private nonisolated static func extractGzipBinary(data: Data, to destination: URL) throws {
+    private nonisolated static func extractGzipBinary(fromFile downloadedFile: URL, to destination: URL) throws {
         let fm = FileManager.default
         let gzURL = destination.appendingPathExtension("gz")
         try? fm.removeItem(at: destination)
         try? fm.removeItem(at: gzURL)
-        try data.write(to: gzURL)
+        try fm.copyItem(at: downloadedFile, to: gzURL)
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
-        proc.arguments = ["-f", gzURL.path]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0, fm.fileExists(atPath: destination.path) else {
-            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "gunzip failed"
-            throw NSError(domain: "SwiftFlashLSP", code: 10, userInfo: [NSLocalizedDescriptionKey: msg])
+        let res = ProcessRunner.run(
+            executablePath: "/usr/bin/gunzip",
+            arguments: ["-f", gzURL.path],
+            timeoutSeconds: 60
+        )
+        guard res.exitCode == 0, fm.fileExists(atPath: destination.path) else {
+            throw NSError(
+                domain: "SwiftFlashLSP",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: res.stderr.isEmpty ? "gunzip failed" : res.stderr]
+            )
         }
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
     }
 
     private nonisolated static func extractZipArchive(
-        data: Data,
+        fromFile zipURL: URL,
         into directory: URL,
         expectedRelativeBinary: String
     ) throws -> URL {
         let fm = FileManager.default
-        let tempRoot = fm.temporaryDirectory.appendingPathComponent("swiftflash-lsp-\(UUID().uuidString)", isDirectory: true)
-        try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: tempRoot) }
+        // Clean stale artifacts from previous versions before extracting a fresh archive.
+        if fm.fileExists(atPath: directory.path) {
+            try fm.removeItem(at: directory)
+        }
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let zipURL = tempRoot.appendingPathComponent("archive.zip")
-        try data.write(to: zipURL)
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        proc.arguments = ["-xk", zipURL.path, directory.path]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unzip failed"
-            throw NSError(domain: "SwiftFlashLSP", code: 11, userInfo: [NSLocalizedDescriptionKey: msg])
+        let res = ProcessRunner.run(
+            executablePath: "/usr/bin/ditto",
+            arguments: ["-xk", zipURL.path, directory.path],
+            timeoutSeconds: 120
+        )
+        guard res.exitCode == 0 else {
+            throw NSError(
+                domain: "SwiftFlashLSP",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: res.stderr.isEmpty ? "unzip failed" : res.stderr]
+            )
         }
 
         guard let binaryURL = findFile(matchingSuffix: expectedRelativeBinary, under: directory) else {
@@ -784,10 +905,8 @@ final class LSPManager: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: npmPath)
         proc.arguments = ["install", "--prefix", prefixDir.path, "--no-audit", "--no-fund"] + packages
-        var env = ProcessInfo.processInfo.environment
         let npmDir = URL(fileURLWithPath: npmPath).deletingLastPathComponent().path
-        env["PATH"] = npmDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        proc.environment = env
+        proc.environment = ToolchainEnvironment.augmentedEnvironment(prependDirs: [npmDir])
         let errText = try runProcessStreamingOutput(proc, onLogLine: onLogLine)
 
         let binURL = prefixDir.appendingPathComponent("node_modules/.bin/\(binaryName)")
@@ -810,11 +929,11 @@ final class LSPManager: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: goPath)
         proc.arguments = ["install", "-v", packagePath]
-        var env = ProcessInfo.processInfo.environment
         let goDir = URL(fileURLWithPath: goPath).deletingLastPathComponent().path
-        env["PATH"] = goDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        env["GOBIN"] = binDir.path
-        proc.environment = env
+        proc.environment = ToolchainEnvironment.augmentedEnvironment(
+            prependDirs: [goDir],
+            extraVariables: ["GOBIN": binDir.path]
+        )
         let errText = try runProcessStreamingOutput(proc, onLogLine: onLogLine)
 
         let binURL = binDir.appendingPathComponent(binaryName)
@@ -833,40 +952,54 @@ final class LSPManager: ObservableObject {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        final class ErrBuffer: @unchecked Sendable {
+        final class StreamCollector: @unchecked Sendable {
             private let lock = NSLock()
-            private var text = ""
-            func append(_ str: String) {
-                lock.lock()
-                text += str
-                lock.unlock()
-            }
-            func value() -> String {
+            private var outDecoder = IncrementalLineDecoder()
+            private var errDecoder = IncrementalLineDecoder()
+            private var errLines: [String] = []
+
+            func append(_ data: Data, isError: Bool) -> [String] {
                 lock.lock()
                 defer { lock.unlock() }
-                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lines = isError ? errDecoder.append(data) : outDecoder.append(data)
+                if isError {
+                    errLines.append(contentsOf: lines)
+                }
+                return lines
+            }
+
+            func flushAll() -> ([String], String) {
+                lock.lock()
+                defer { lock.unlock() }
+                let outTail = outDecoder.flush()
+                let errTail = errDecoder.flush()
+                errLines.append(contentsOf: errTail)
+                return (outTail + errTail, errLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
-        let errBuffer = ErrBuffer()
 
-        let forwardChunk: @Sendable (Data, Bool) -> Void = { data, captureErr in
-            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
-            if captureErr {
-                errBuffer.append(str)
-            }
-            let lines = str.components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            if let last = lines.last {
+        let collector = StreamCollector()
+        let forward: @Sendable ([String]) -> Void = { lines in
+            if let last = lines.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).last(where: { !$0.isEmpty }) {
                 onLogLine(last)
             }
         }
 
         outPipe.fileHandleForReading.readabilityHandler = { handle in
-            forwardChunk(handle.availableData, false)
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            forward(collector.append(data, isError: false))
         }
         errPipe.fileHandleForReading.readabilityHandler = { handle in
-            forwardChunk(handle.availableData, true)
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            forward(collector.append(data, isError: true))
         }
 
         try proc.run()
@@ -874,6 +1007,18 @@ final class LSPManager: ObservableObject {
 
         outPipe.fileHandleForReading.readabilityHandler = nil
         errPipe.fileHandleForReading.readabilityHandler = nil
-        return errBuffer.value()
+
+        let remOut = outPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remOut.isEmpty {
+            forward(collector.append(remOut, isError: false))
+        }
+        let remErr = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remErr.isEmpty {
+            forward(collector.append(remErr, isError: true))
+        }
+
+        let (tailLines, errSummary) = collector.flushAll()
+        forward(tailLines)
+        return errSummary
     }
 }

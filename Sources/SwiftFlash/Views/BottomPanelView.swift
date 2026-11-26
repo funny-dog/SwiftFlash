@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum BottomPanelTab: String, CaseIterable {
+enum BottomPanelTab: String, CaseIterable, Sendable {
     case terminal
     case run
     case problems
@@ -14,14 +14,7 @@ struct BottomPanelView: View {
     @ObservedObject private var themeManager = ThemeManager.shared
 
     private var consoleFont: Font {
-        let size = max(11, themeManager.editorFontSize - 1)
-        if themeManager.editorFontFamily == "System Monospace" {
-            return .system(size: size, design: .monospaced)
-        }
-        if let nsFont = NSFont(name: themeManager.editorFontFamily, size: size) {
-            return Font(nsFont)
-        }
-        return .system(size: size, design: .monospaced)
+        themeManager.editorSwiftUIFont(size: max(11, themeManager.editorFontSize - 1))
     }
 
     var body: some View {
@@ -30,7 +23,7 @@ struct BottomPanelView: View {
 
             switch workspace.bottomPanelTab {
             case .terminal:
-                IntegratedTerminalView(workspace: workspace, session: session, showHeader: false)
+                IntegratedTerminalView(workspace: workspace, session: session)
             case .run:
                 runOutputBody
             case .problems:
@@ -81,11 +74,15 @@ struct BottomPanelView: View {
                         .frame(width: 12, height: 12)
                 }
 
-                quickChip("swift build", color: ZedTheme.function) {
-                    session.runCommand("swift build")
+                if let buildTask = taskRunner.detectedTasks.first(where: { $0.kind == .build }) {
+                    quickChip(buildTask.name, color: ZedTheme.function) {
+                        session.runCommand(buildTask.command)
+                    }
                 }
-                quickChip("git status", color: ZedTheme.keyword) {
-                    session.runCommand("git status -sb")
+                if workspace.isGitRepository {
+                    quickChip("git status", color: ZedTheme.keyword) {
+                        session.runCommand("git status -sb")
+                    }
                 }
                 if session.isRunning {
                     quickChip(L10n("terminal.stop"), color: ZedTheme.attribute) {
@@ -196,7 +193,7 @@ struct BottomPanelView: View {
                             ForEach(taskRunner.outputLines) { line in
                                 if let loc = line.location {
                                     Button {
-                                        workspace.openFile(url: loc.url, atLine: loc.line)
+                                        workspace.openFile(url: loc.url, atLine: loc.line, atColumn: loc.column)
                                     } label: {
                                         Text(line.text)
                                             .font(consoleFont)
@@ -219,7 +216,7 @@ struct BottomPanelView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                     }
-                    .onChange(of: taskRunner.outputLines.count) { _, _ in
+                    .onChange(of: taskRunner.outputRevision) { _, _ in
                         proxy.scrollTo("RUN_BOTTOM", anchor: .bottom)
                     }
                 }
@@ -245,7 +242,11 @@ struct BottomPanelView: View {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(items) { entry in
                             Button {
-                                workspace.openFile(url: entry.fileURL, atLine: entry.diagnostic.range.start.line + 1)
+                                workspace.openFile(
+                                    url: entry.fileURL,
+                                    atLine: entry.diagnostic.range.start.line + 1,
+                                    atColumn: entry.diagnostic.range.start.character + 1
+                                )
                             } label: {
                                 HStack(spacing: 8) {
                                     Image(systemName: entry.diagnostic.severity.iconName)

@@ -2,16 +2,15 @@ import Foundation
 
 // MARK: - Find & Replace Pure Logic & State
 
-struct FindMatchResult: Equatable {
-    let range: NSRange
-}
-
 enum EditorFindEngine {
+    static let defaultDisplayMatchLimit = 5000
+
     static func findMatches(
         in text: String,
         query: String,
         isCaseSensitive: Bool,
-        isRegex: Bool
+        isRegex: Bool,
+        limit: Int? = defaultDisplayMatchLimit
     ) -> [NSRange] {
         guard !query.isEmpty, !text.isEmpty else { return [] }
         let nsText = text as NSString
@@ -22,9 +21,15 @@ enum EditorFindEngine {
             guard let regex = try? NSRegularExpression(pattern: query, options: options) else {
                 return []
             }
-            return regex.matches(in: text, options: [], range: fullRange)
-                .map(\.range)
-                .filter { $0.length > 0 }
+            var results: [NSRange] = []
+            regex.enumerateMatches(in: text, options: [], range: fullRange) { match, _, stop in
+                guard let range = match?.range, range.length > 0 else { return }
+                results.append(range)
+                if let limit, results.count >= limit {
+                    stop.pointee = true
+                }
+            }
+            return results
         } else {
             let options: NSString.CompareOptions = isCaseSensitive ? [] : [.caseInsensitive]
             var results: [NSRange] = []
@@ -37,10 +42,32 @@ enum EditorFindEngine {
                 }
                 results.append(found)
                 searchStart = found.location + found.length
-                if results.count >= 5000 { break }
+                if let limit, results.count >= limit { break }
             }
             return results
         }
+    }
+
+    static func replacementString(
+        in text: String,
+        matchRange: NSRange,
+        query: String,
+        replacement: String,
+        isCaseSensitive: Bool,
+        isRegex: Bool
+    ) -> String {
+        guard isRegex else { return replacement }
+        let nsText = text as NSString
+        guard matchRange.location >= 0, matchRange.location + matchRange.length <= nsText.length else {
+            return replacement
+        }
+        let options: NSRegularExpression.Options = isCaseSensitive ? [] : [.caseInsensitive]
+        guard let regex = try? NSRegularExpression(pattern: query, options: options),
+              let match = regex.firstMatch(in: text, options: [], range: matchRange),
+              match.range == matchRange else {
+            return replacement
+        }
+        return regex.replacementString(for: match, in: text, offset: 0, template: replacement)
     }
 
     static func replaceAll(
@@ -50,23 +77,34 @@ enum EditorFindEngine {
         isCaseSensitive: Bool,
         isRegex: Bool
     ) -> (updatedText: String, count: Int) {
-        let matches = findMatches(in: text, query: query, isCaseSensitive: isCaseSensitive, isRegex: isRegex)
-        guard !matches.isEmpty else { return (text, 0) }
+        guard !query.isEmpty, !text.isEmpty else { return (text, 0) }
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
 
         if isRegex {
             let options: NSRegularExpression.Options = isCaseSensitive ? [] : [.caseInsensitive]
             guard let regex = try? NSRegularExpression(pattern: query, options: options) else {
                 return (text, 0)
             }
+            let nonEmptyMatches = regex.matches(in: text, options: [], range: fullRange)
+                .filter { $0.range.length > 0 }
+            guard !nonEmptyMatches.isEmpty else { return (text, 0) }
+
             let mutable = NSMutableString(string: text)
-            let count = regex.replaceMatches(
-                in: mutable,
-                options: [],
-                range: NSRange(location: 0, length: mutable.length),
-                withTemplate: replacement
-            )
-            return (mutable as String, count)
+            for match in nonEmptyMatches.reversed() {
+                let expanded = regex.replacementString(for: match, in: text, offset: 0, template: replacement)
+                mutable.replaceCharacters(in: match.range, with: expanded)
+            }
+            return (mutable as String, nonEmptyMatches.count)
         } else {
+            let matches = findMatches(
+                in: text,
+                query: query,
+                isCaseSensitive: isCaseSensitive,
+                isRegex: false,
+                limit: nil
+            )
+            guard !matches.isEmpty else { return (text, 0) }
             let mutable = NSMutableString(string: text)
             for range in matches.reversed() {
                 mutable.replaceCharacters(in: range, with: replacement)
@@ -100,6 +138,7 @@ final class EditorFindState: ObservableObject {
     @Published var isFindBarVisible: Bool = false
     @Published var isReplaceExpanded: Bool = false
     @Published var isGoToLineVisible: Bool = false
+    @Published var focusRequestNonce: Int = 0
 
     @Published var findQuery: String = ""
     @Published var replaceQuery: String = ""

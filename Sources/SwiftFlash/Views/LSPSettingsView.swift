@@ -1,11 +1,12 @@
 import SwiftUI
 
 struct LSPSettingsView: View {
-    var workspace: WorkspaceState? = nil
+    @ObservedObject var workspace: WorkspaceState
     @ObservedObject private var lspManager = LSPManager.shared
+    @ObservedObject private var themeManager = ThemeManager.shared
 
     private var matchedServerIDForActiveTab: String? {
-        guard let tab = workspace?.activeTab else { return nil }
+        guard let tab = workspace.activeTab else { return nil }
         return lspManager.serverDefinition(for: tab.language, url: tab.url)?.id
     }
 

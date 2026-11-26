@@ -1,10 +1,11 @@
 import AppKit
 import Combine
 import Foundation
+import SwiftUI
 
 // MARK: - Theme Identifiers
 
-enum ThemeID: String, CaseIterable, Identifiable {
+enum ThemeID: String, CaseIterable, Identifiable, Sendable {
     case zedOneDark = "Zed One Dark"
     case zedGruvboxLight = "Zed Gruvbox Light"
     case zedOneLight = "Zed One Light"
@@ -13,21 +14,9 @@ enum ThemeID: String, CaseIterable, Identifiable {
     case githubDarkDimmed = "GitHub Dark Dimmed"
 
     var id: String { rawValue }
-
-    @MainActor
-    var subtitle: String {
-        switch self {
-        case .zedOneDark: return L10n("theme.subtitle.zedOneDark")
-        case .zedGruvboxLight: return L10n("theme.subtitle.zedGruvboxLight")
-        case .zedOneLight: return L10n("theme.subtitle.zedOneLight")
-        case .tokyoNight: return L10n("theme.subtitle.tokyoNight")
-        case .catppuccinMocha: return L10n("theme.subtitle.catppuccinMocha")
-        case .githubDarkDimmed: return L10n("theme.subtitle.githubDarkDimmed")
-        }
-    }
 }
 
-// MARK: - Theme Palette
+// MARK: - Theme Palette (Sendable Hex Definition)
 
 struct ThemePalette: Sendable, Equatable {
     let id: ThemeID
@@ -64,38 +53,6 @@ struct ThemePalette: Sendable, Equatable {
     let numberHex: UInt32
     let attributeHex: UInt32
     let operatorHex: UInt32
-
-    var background: NSColor { NSColor(hex: backgroundHex) }
-    var sidebarBackground: NSColor { NSColor(hex: sidebarBackgroundHex) }
-    var tabBarBackground: NSColor { NSColor(hex: tabBarBackgroundHex) }
-    var activeTabBackground: NSColor { NSColor(hex: activeTabBackgroundHex) }
-    var statusBarBackground: NSColor { NSColor(hex: statusBarBackgroundHex) }
-    var gutterBackground: NSColor { NSColor(hex: gutterBackgroundHex) }
-    var border: NSColor { NSColor(hex: borderHex) }
-
-    var activeLineBackground: NSColor { NSColor(hex: activeLineBackgroundHex) }
-    var selectionBackground: NSColor { NSColor(hex: selectionBackgroundHex) }
-    var cursor: NSColor { NSColor(hex: cursorHex) }
-
-    var primaryText: NSColor { NSColor(hex: primaryTextHex) }
-    var secondaryText: NSColor { NSColor(hex: secondaryTextHex) }
-    var mutedText: NSColor { NSColor(hex: mutedTextHex) }
-    var hoverBackground: NSColor { NSColor(hex: hoverBackgroundHex) }
-    var pillBackground: NSColor { NSColor(hex: pillBackgroundHex) }
-    var pillText: NSColor { NSColor(hex: pillTextHex) }
-
-    var plainText: NSColor { NSColor(hex: plainTextHex) }
-    var gutterText: NSColor { NSColor(hex: gutterTextHex) }
-    var gutterActiveText: NSColor { NSColor(hex: gutterActiveTextHex) }
-
-    var keyword: NSColor { NSColor(hex: keywordHex) }
-    var typeName: NSColor { NSColor(hex: typeNameHex) }
-    var function: NSColor { NSColor(hex: functionHex) }
-    var string: NSColor { NSColor(hex: stringHex) }
-    var comment: NSColor { NSColor(hex: commentHex) }
-    var number: NSColor { NSColor(hex: numberHex) }
-    var attribute: NSColor { NSColor(hex: attributeHex) }
-    var operatorColor: NSColor { NSColor(hex: operatorHex) }
 
     var previewSwatches: [UInt32] {
         [backgroundHex, sidebarBackgroundHex, pillBackgroundHex, functionHex, keywordHex, stringHex]
@@ -304,6 +261,93 @@ struct ThemePalette: Sendable, Equatable {
     }
 }
 
+// MARK: - Cached NSColor Palette
+
+@MainActor
+struct ResolvedThemeColors {
+    let palette: ThemePalette
+    let background: NSColor
+    let sidebarBackground: NSColor
+    let tabBarBackground: NSColor
+    let activeTabBackground: NSColor
+    let statusBarBackground: NSColor
+    let gutterBackground: NSColor
+    let border: NSColor
+
+    let activeLineBackground: NSColor
+    let selectionBackground: NSColor
+    let cursor: NSColor
+
+    let primaryText: NSColor
+    let secondaryText: NSColor
+    let mutedText: NSColor
+    let hoverBackground: NSColor
+    let pillBackground: NSColor
+    let pillText: NSColor
+
+    let plainText: NSColor
+    let gutterText: NSColor
+    let gutterActiveText: NSColor
+
+    let keyword: NSColor
+    let typeName: NSColor
+    let function: NSColor
+    let string: NSColor
+    let comment: NSColor
+    let number: NSColor
+    let attribute: NSColor
+    let operatorColor: NSColor
+
+    let tokenColorLookup: [UInt32: NSColor]
+
+    init(palette: ThemePalette) {
+        self.palette = palette
+        self.background = NSColor(hex: palette.backgroundHex)
+        self.sidebarBackground = NSColor(hex: palette.sidebarBackgroundHex)
+        self.tabBarBackground = NSColor(hex: palette.tabBarBackgroundHex)
+        self.activeTabBackground = NSColor(hex: palette.activeTabBackgroundHex)
+        self.statusBarBackground = NSColor(hex: palette.statusBarBackgroundHex)
+        self.gutterBackground = NSColor(hex: palette.gutterBackgroundHex)
+        self.border = NSColor(hex: palette.borderHex)
+
+        self.activeLineBackground = NSColor(hex: palette.activeLineBackgroundHex)
+        self.selectionBackground = NSColor(hex: palette.selectionBackgroundHex)
+        self.cursor = NSColor(hex: palette.cursorHex)
+
+        self.primaryText = NSColor(hex: palette.primaryTextHex)
+        self.secondaryText = NSColor(hex: palette.secondaryTextHex)
+        self.mutedText = NSColor(hex: palette.mutedTextHex)
+        self.hoverBackground = NSColor(hex: palette.hoverBackgroundHex)
+        self.pillBackground = NSColor(hex: palette.pillBackgroundHex)
+        self.pillText = NSColor(hex: palette.pillTextHex)
+
+        self.plainText = NSColor(hex: palette.plainTextHex)
+        self.gutterText = NSColor(hex: palette.gutterTextHex)
+        self.gutterActiveText = NSColor(hex: palette.gutterActiveTextHex)
+
+        self.keyword = NSColor(hex: palette.keywordHex)
+        self.typeName = NSColor(hex: palette.typeNameHex)
+        self.function = NSColor(hex: palette.functionHex)
+        self.string = NSColor(hex: palette.stringHex)
+        self.comment = NSColor(hex: palette.commentHex)
+        self.number = NSColor(hex: palette.numberHex)
+        self.attribute = NSColor(hex: palette.attributeHex)
+        self.operatorColor = NSColor(hex: palette.operatorHex)
+
+        self.tokenColorLookup = [
+            palette.plainTextHex: plainText,
+            palette.keywordHex: keyword,
+            palette.typeNameHex: typeName,
+            palette.functionHex: function,
+            palette.stringHex: string,
+            palette.commentHex: comment,
+            palette.numberHex: number,
+            palette.attributeHex: attribute,
+            palette.operatorHex: operatorColor
+        ]
+    }
+}
+
 // MARK: - Theme & Font Manager
 
 @MainActor
@@ -318,8 +362,22 @@ final class ThemeManager: ObservableObject {
         static let uiFontSize = "swiftflash.uiFontSize"
     }
 
+    private static let preferredFontOrder = [
+        "JetBrains Mono",
+        "SF Mono",
+        "Menlo",
+        "Monaco",
+        "Fira Code",
+        "Hack",
+        "Cascadia Code",
+        "Iosevka",
+        "Courier New",
+        "System Monospace"
+    ]
+
     @Published var currentThemeID: ThemeID {
         didSet {
+            resolvedColors = ResolvedThemeColors(palette: ThemePalette.palette(for: currentThemeID))
             UserDefaults.standard.set(currentThemeID.rawValue, forKey: Keys.themeID)
         }
     }
@@ -337,7 +395,7 @@ final class ThemeManager: ObservableObject {
                 editorFontSize = clamped
                 return
             }
-            UserDefaults.standard.set(Double(editorFontSize), forKey: Keys.editorFontSize)
+            UserDefaults.standard.set(Double(clamped), forKey: Keys.editorFontSize)
         }
     }
 
@@ -348,7 +406,7 @@ final class ThemeManager: ObservableObject {
                 lineHeightMultiplier = clamped
                 return
             }
-            UserDefaults.standard.set(Double(lineHeightMultiplier), forKey: Keys.lineHeightMultiplier)
+            UserDefaults.standard.set(Double(clamped), forKey: Keys.lineHeightMultiplier)
         }
     }
 
@@ -359,73 +417,91 @@ final class ThemeManager: ObservableObject {
                 uiFontSize = clamped
                 return
             }
-            UserDefaults.standard.set(Double(uiFontSize), forKey: Keys.uiFontSize)
+            UserDefaults.standard.set(Double(clamped), forKey: Keys.uiFontSize)
         }
     }
 
-    let availableMonospacedFonts: [String]
+    private(set) var resolvedColors: ResolvedThemeColors
+
+    /// Lazily enumerates fixed-pitch system fonts on first access (e.g. when opening Settings)
+    /// instead of instantiating hundreds of NSFonts synchronously during app startup.
+    lazy var availableMonospacedFonts: [String] = {
+        let fontManager = NSFontManager.shared
+        var fontList: [String] = []
+        var seen = Set<String>()
+
+        for candidate in Self.preferredFontOrder {
+            if candidate == "System Monospace" || NSFont(name: candidate, size: 13) != nil {
+                if seen.insert(candidate).inserted {
+                    fontList.append(candidate)
+                }
+            }
+        }
+
+        // Fast query: only inspect fonts matching fixedPitchFontMask instead of all system families.
+        let fixedPitchPostScriptNames = fontManager.availableFontNames(with: .fixedPitchFontMask) ?? []
+        var discoveredFamilies = Set<String>()
+        for psName in fixedPitchPostScriptNames {
+            if let family = NSFont(name: psName, size: 13)?.familyName {
+                discoveredFamilies.insert(family)
+            }
+        }
+        for family in discoveredFamilies.sorted() where seen.insert(family).inserted {
+            fontList.append(family)
+        }
+        return fontList
+    }()
 
     var palette: ThemePalette {
-        ThemePalette.palette(for: currentThemeID)
+        resolvedColors.palette
     }
 
     var editorFont: NSFont {
+        editorFont(size: editorFontSize)
+    }
+
+    func editorFont(size: CGFloat) -> NSFont {
         if editorFontFamily == "System Monospace" {
-            return NSFont.monospacedSystemFont(ofSize: editorFontSize, weight: .regular)
+            return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
         }
-        return NSFont(name: editorFontFamily, size: editorFontSize)
-            ?? NSFont(name: "SF Mono", size: editorFontSize)
-            ?? NSFont.monospacedSystemFont(ofSize: editorFontSize, weight: .regular)
+        return NSFont(name: editorFontFamily, size: size)
+            ?? NSFont(name: "SF Mono", size: size)
+            ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    func editorSwiftUIFont(size: CGFloat) -> Font {
+        if editorFontFamily == "System Monospace" {
+            return .system(size: size, design: .monospaced)
+        }
+        if let nsFont = NSFont(name: editorFontFamily, size: size) {
+            return Font(nsFont)
+        }
+        return .system(size: size, design: .monospaced)
     }
 
     private init() {
         let defaults = UserDefaults.standard
+        let initialTheme: ThemeID
         if let savedTheme = defaults.string(forKey: Keys.themeID),
            let parsedTheme = ThemeID(rawValue: savedTheme) {
-            self.currentThemeID = parsedTheme
+            initialTheme = parsedTheme
         } else {
-            self.currentThemeID = .zedOneDark
+            initialTheme = .zedOneDark
         }
-
-        let preferredOrder = [
-            "JetBrains Mono",
-            "SF Mono",
-            "Menlo",
-            "Monaco",
-            "Fira Code",
-            "Hack",
-            "Cascadia Code",
-            "Iosevka",
-            "Courier New",
-            "System Monospace"
-        ]
-
-        let fontManager = NSFontManager.shared
-        let installedMonospace = fontManager.availableFontFamilies.filter { family in
-            guard let font = NSFont(name: family, size: 13) else { return false }
-            return font.isFixedPitch || fontManager.traits(of: font).contains(.fixedPitchFontMask)
-        }
-
-        var fontList: [String] = []
-        for candidate in preferredOrder {
-            if candidate == "System Monospace" || NSFont(name: candidate, size: 13) != nil {
-                fontList.append(candidate)
-            }
-        }
-        for installed in installedMonospace.sorted() where !fontList.contains(installed) {
-            fontList.append(installed)
-        }
-        self.availableMonospacedFonts = fontList
+        self.currentThemeID = initialTheme
+        self.resolvedColors = ResolvedThemeColors(palette: ThemePalette.palette(for: initialTheme))
 
         if let savedFamily = defaults.string(forKey: Keys.editorFontFamily),
-           fontList.contains(savedFamily) {
+           savedFamily == "System Monospace" || NSFont(name: savedFamily, size: 13) != nil {
             self.editorFontFamily = savedFamily
-        } else if fontList.contains("JetBrains Mono") {
+        } else if NSFont(name: "JetBrains Mono", size: 13) != nil {
             self.editorFontFamily = "JetBrains Mono"
-        } else if fontList.contains("SF Mono") {
+        } else if NSFont(name: "SF Mono", size: 13) != nil {
             self.editorFontFamily = "SF Mono"
         } else {
-            self.editorFontFamily = fontList.first ?? "System Monospace"
+            self.editorFontFamily = Self.preferredFontOrder.first(where: {
+                $0 == "System Monospace" || NSFont(name: $0, size: 13) != nil
+            }) ?? "System Monospace"
         }
 
         let savedSize = defaults.double(forKey: Keys.editorFontSize)

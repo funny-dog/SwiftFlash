@@ -2,36 +2,50 @@ import Foundation
 
 // MARK: - JSON-RPC Content-Length Framer
 
-struct LSPMessageFramer {
+struct LSPMessageFramer: Sendable {
+    private static let headerSeparator = Data("\r\n\r\n".utf8)
+    static let maxMessageBytes = 64 * 1024 * 1024
+
     private var buffer = Data()
 
     mutating func append(_ chunk: Data) -> [Data] {
+        guard !chunk.isEmpty else { return [] }
         buffer.append(chunk)
         var messages: [Data] = []
-        let separator = Data("\r\n\r\n".utf8)
+        var cursor = buffer.startIndex
 
-        while true {
-            guard let headerEndRange = buffer.range(of: separator) else {
+        while cursor < buffer.endIndex {
+            guard let headerEndRange = buffer.range(of: Self.headerSeparator, in: cursor..<buffer.endIndex) else {
                 break
             }
 
-            let headerData = buffer.subdata(in: 0..<headerEndRange.lowerBound)
+            let headerData = buffer[cursor..<headerEndRange.lowerBound]
             guard let headerString = String(data: headerData, encoding: .utf8),
-                  let contentLength = Self.parseContentLength(from: headerString) else {
-                // Corrupt header; drop up to separator to recover
-                buffer.removeSubrange(0..<headerEndRange.upperBound)
+                  let contentLength = Self.parseContentLength(from: headerString),
+                  contentLength >= 0,
+                  contentLength <= Self.maxMessageBytes else {
+                // Corrupt or out-of-bounds header; drop up to separator to recover safely.
+                cursor = headerEndRange.upperBound
                 continue
             }
 
             let bodyStart = headerEndRange.upperBound
-            let bodyEnd = bodyStart + contentLength
-            guard buffer.count >= bodyEnd else {
+            let remaining = buffer.distance(from: bodyStart, to: buffer.endIndex)
+            guard remaining >= contentLength else {
                 break
             }
 
-            let payload = buffer.subdata(in: bodyStart..<bodyEnd)
-            messages.append(payload)
-            buffer.removeSubrange(0..<bodyEnd)
+            let bodyEnd = buffer.index(bodyStart, offsetBy: contentLength)
+            messages.append(Data(buffer[bodyStart..<bodyEnd]))
+            cursor = bodyEnd
+        }
+
+        if cursor > buffer.startIndex {
+            if cursor >= buffer.endIndex {
+                buffer.removeAll(keepingCapacity: true)
+            } else {
+                buffer = Data(buffer[cursor..<buffer.endIndex])
+            }
         }
 
         return messages
@@ -49,7 +63,12 @@ struct LSPMessageFramer {
             let parts = rawLine.split(separator: ":", maxSplits: 1)
             guard parts.count == 2 else { continue }
             if parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
-                return Int(parts[1].trimmingCharacters(in: .whitespaces))
+                guard let value = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+                      value >= 0,
+                      value <= maxMessageBytes else {
+                    return nil
+                }
+                return value
             }
         }
         return nil
@@ -59,6 +78,10 @@ struct LSPMessageFramer {
 // MARK: - LSP Diagnostics & Response Parsing Helpers
 
 enum LSPPayloadParser {
+    private static let placeholderWithDefaultRegex = try! NSRegularExpression(pattern: #"\$\{\d+:([^}]*)\}"#)
+    private static let choicePlaceholderRegex = try! NSRegularExpression(pattern: #"\$\{\d+\|([^|,}]*)[^}]*\|\}"#)
+    private static let barePlaceholderRegex = try! NSRegularExpression(pattern: #"\$\d+"#)
+
     static func parseDiagnostics(from params: [String: Any]) -> (uri: String, diagnostics: [LSPDiagnostic])? {
         guard let uri = params["uri"] as? String,
               let rawDiagnostics = params["diagnostics"] as? [[String: Any]] else {
@@ -189,34 +212,30 @@ enum LSPPayloadParser {
     }
 
     static func sanitizeSnippetPlaceholders(_ text: String) -> String {
-        // Strip basic LSP snippet markers like `${1:arg}` -> `arg`, `$0` -> ``
+        guard text.contains("$") else { return text }
         var output = text
-        if let regex = try? NSRegularExpression(pattern: #"\$\{\d+:([^}]*)\}"#) {
-            let range = NSRange(location: 0, length: (output as NSString).length)
-            output = regex.stringByReplacingMatches(in: output, range: range, withTemplate: "$1")
-        }
-        if let bareRegex = try? NSRegularExpression(pattern: #"\$\d+"#) {
-            let range = NSRange(location: 0, length: (output as NSString).length)
-            output = bareRegex.stringByReplacingMatches(in: output, range: range, withTemplate: "")
-        }
+        var range = NSRange(location: 0, length: (output as NSString).length)
+        output = choicePlaceholderRegex.stringByReplacingMatches(in: output, range: range, withTemplate: "$1")
+        range = NSRange(location: 0, length: (output as NSString).length)
+        output = placeholderWithDefaultRegex.stringByReplacingMatches(in: output, range: range, withTemplate: "$1")
+        range = NSRange(location: 0, length: (output as NSString).length)
+        output = barePlaceholderRegex.stringByReplacingMatches(in: output, range: range, withTemplate: "")
         return output
     }
 }
 
 // MARK: - LSP Server Connection (Stdio JSON-RPC 2.0)
 
-enum LSPClientError: LocalizedError {
+enum LSPClientError: LocalizedError, Sendable {
     case processNotRunning
     case timeout
     case serverError(String)
-    case invalidResponse
 
     var errorDescription: String? {
         switch self {
         case .processNotRunning: return "Language server is not running"
         case .timeout: return "Language server request timed out"
         case .serverError(let msg): return msg
-        case .invalidResponse: return "Invalid LSP response"
         }
     }
 }
@@ -230,14 +249,47 @@ final class LSPServerConnection: @unchecked Sendable {
     private let stderrHandle: FileHandle
 
     private let ioQueue = DispatchQueue(label: "dev.swiftflash.lsp.io")
+    private let stateLock = NSLock()
     private var framer = LSPMessageFramer()
     private var nextRequestID: Int = 1
-    private var pendingRequests: [Int: CheckedContinuation<Any?, Error>] = [:]
-    private var isClosed = false
-    private(set) var isInitialized = false
+    private var pendingRequests: [Int: CheckedContinuation<Data, Error>] = [:]
+    private var isClosedFlag = false
+    private var isInitializedFlag = false
 
-    var onDiagnostics: (@Sendable (String, [LSPDiagnostic]) -> Void)?
-    var onTerminated: (@Sendable () -> Void)?
+    private var diagnosticsCallback: (@Sendable (String, [LSPDiagnostic]) -> Void)?
+    private var terminatedCallback: (@Sendable () -> Void)?
+
+    var isInitialized: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isInitializedFlag && !isClosedFlag && process.isRunning
+    }
+
+    var onDiagnostics: (@Sendable (String, [LSPDiagnostic]) -> Void)? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return diagnosticsCallback
+        }
+        set {
+            stateLock.lock()
+            diagnosticsCallback = newValue
+            stateLock.unlock()
+        }
+    }
+
+    var onTerminated: (@Sendable () -> Void)? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return terminatedCallback
+        }
+        set {
+            stateLock.lock()
+            terminatedCallback = newValue
+            stateLock.unlock()
+        }
+    }
 
     init(
         serverID: String,
@@ -252,17 +304,7 @@ final class LSPServerConnection: @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: executablePath)
         proc.arguments = arguments
         proc.currentDirectoryURL = workspaceRoot
-
-        var env = ProcessInfo.processInfo.environment
-        let extraBins = [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cargo/bin").path,
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("go/bin").path
-        ]
-        let existingPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = (extraBins + [existingPath]).joined(separator: ":")
-        proc.environment = env
+        proc.environment = ToolchainEnvironment.augmentedEnvironment()
 
         let inPipe = Pipe()
         let outPipe = Pipe()
@@ -281,6 +323,7 @@ final class LSPServerConnection: @unchecked Sendable {
     }
 
     deinit {
+        // Non-blocking cleanup using stateLock (never calls ioQueue.sync to prevent re-entrancy deadlock).
         shutdownNow()
     }
 
@@ -292,11 +335,12 @@ final class LSPServerConnection: @unchecked Sendable {
                 self?.handleEOF()
                 return
             }
-            self?.ioQueue.async {
-                guard let self, !self.isClosed else { return }
-                let payloads = self.framer.append(data)
+            guard let client = self else { return }
+            client.ioQueue.async { [weak client] in
+                guard let client, !client.isClosed else { return }
+                let payloads = client.framer.append(data)
                 for payload in payloads {
-                    self.handleIncomingPayload(payload)
+                    client.handleIncomingPayload(payload)
                 }
             }
         }
@@ -308,17 +352,28 @@ final class LSPServerConnection: @unchecked Sendable {
         }
     }
 
+    private var isClosed: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isClosedFlag
+    }
+
     private func handleEOF() {
-        ioQueue.async { [weak self] in
-            guard let self, !self.isClosed else { return }
-            self.isClosed = true
-            let pending = self.pendingRequests
-            self.pendingRequests.removeAll()
-            for (_, cont) in pending {
-                cont.resume(throwing: LSPClientError.processNotRunning)
-            }
-            self.onTerminated?()
+        stateLock.lock()
+        guard !isClosedFlag else {
+            stateLock.unlock()
+            return
         }
+        isClosedFlag = true
+        let pending = pendingRequests
+        pendingRequests.removeAll()
+        let onTerm = terminatedCallback
+        stateLock.unlock()
+
+        for (_, cont) in pending {
+            cont.resume(throwing: LSPClientError.processNotRunning)
+        }
+        onTerm?()
     }
 
     private func handleIncomingPayload(_ payload: Data) {
@@ -327,9 +382,7 @@ final class LSPServerConnection: @unchecked Sendable {
         }
 
         if let rawID = obj["id"], !(rawID is NSNull) {
-            // Response or server->client request
             if let method = obj["method"] as? String {
-                // Reply empty success to server-initiated requests (e.g. client/registerCapability, workspace/configuration)
                 let reply: [String: Any]
                 if method == "workspace/configuration" {
                     let count = ((obj["params"] as? [String: Any])?["items"] as? [Any])?.count ?? 0
@@ -337,87 +390,120 @@ final class LSPServerConnection: @unchecked Sendable {
                 } else {
                     reply = ["jsonrpc": "2.0", "id": rawID, "result": NSNull()]
                 }
-                sendRawJSON(reply)
+                if let replyData = try? JSONSerialization.data(withJSONObject: reply) {
+                    writeFrameOnIOQueue(LSPMessageFramer.encode(replyData))
+                }
                 return
             }
 
-            if let id = rawID as? Int,
-               let cont = pendingRequests.removeValue(forKey: id) {
-                if let errorObj = obj["error"] as? [String: Any] {
-                    let msg = (errorObj["message"] as? String) ?? "LSP error"
-                    cont.resume(throwing: LSPClientError.serverError(msg))
-                } else {
-                    cont.resume(returning: obj["result"])
+            if let id = rawID as? Int {
+                stateLock.lock()
+                let cont = pendingRequests.removeValue(forKey: id)
+                stateLock.unlock()
+
+                if let cont {
+                    if let errorObj = obj["error"] as? [String: Any] {
+                        let msg = (errorObj["message"] as? String) ?? "LSP error"
+                        cont.resume(throwing: LSPClientError.serverError(msg))
+                    } else {
+                        cont.resume(returning: payload)
+                    }
                 }
             }
         } else if let method = obj["method"] as? String {
             if method == "textDocument/publishDiagnostics",
                let params = obj["params"] as? [String: Any],
                let parsed = LSPPayloadParser.parseDiagnostics(from: params) {
-                onDiagnostics?(parsed.uri, parsed.diagnostics)
+                let callback = onDiagnostics
+                callback?(parsed.uri, parsed.diagnostics)
             }
         }
     }
 
-    private func sendRawJSON(_ dict: [String: Any]) {
-        guard !isClosed,
-              let data = try? JSONSerialization.data(withJSONObject: dict) else {
-            return
+    private func writeFrameOnIOQueue(_ frame: Data) {
+        guard !isClosed else { return }
+        do {
+            try stdinHandle.write(contentsOf: frame)
+        } catch {
+            handleEOF()
         }
-        let frame = LSPMessageFramer.encode(data)
-        try? stdinHandle.write(contentsOf: frame)
+    }
+
+    private func encodeMessage(_ dict: [String: Any]) -> Data? {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return LSPMessageFramer.encode(data)
     }
 
     func sendNotification(method: String, params: [String: Any]) {
+        let message: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        ]
+        guard let frame = encodeMessage(message) else { return }
         ioQueue.async { [weak self] in
-            guard let self, !self.isClosed else { return }
-            let message: [String: Any] = [
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params
-            ]
-            self.sendRawJSON(message)
+            self?.writeFrameOnIOQueue(frame)
         }
     }
 
-    func sendRequest(method: String, params: [String: Any], timeoutSeconds: TimeInterval = 5.0) async throws -> Any? {
-        guard process.isRunning else {
+    private func sendRequestPayload(
+        method: String,
+        params: [String: Any],
+        timeoutSeconds: TimeInterval = 5.0
+    ) async throws -> Data {
+        guard process.isRunning, !isClosed else {
             throw LSPClientError.processNotRunning
         }
 
-        let requestID: Int = ioQueue.sync {
+        let requestID = stateLock.withLock {
             let id = nextRequestID
             nextRequestID += 1
             return id
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            ioQueue.async { [weak self] in
-                guard let self, !self.isClosed, self.process.isRunning else {
-                    continuation.resume(throwing: LSPClientError.processNotRunning)
-                    return
-                }
-                self.pendingRequests[requestID] = continuation
-                let message: [String: Any] = [
-                    "jsonrpc": "2.0",
-                    "id": requestID,
-                    "method": method,
-                    "params": params
-                ]
-                self.sendRawJSON(message)
+        let message: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": requestID,
+            "method": method,
+            "params": params
+        ]
+        guard let frame = encodeMessage(message) else {
+            throw LSPClientError.serverError("Failed to serialize LSP request")
+        }
 
-                self.ioQueue.asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
-                    guard let self else { return }
-                    if let timedOut = self.pendingRequests.removeValue(forKey: requestID) {
-                        timedOut.resume(throwing: LSPClientError.timeout)
-                    }
-                }
+        return try await withCheckedThrowingContinuation { continuation in
+            stateLock.lock()
+            guard !isClosedFlag, process.isRunning else {
+                stateLock.unlock()
+                continuation.resume(throwing: LSPClientError.processNotRunning)
+                return
+            }
+            pendingRequests[requestID] = continuation
+            stateLock.unlock()
+
+            ioQueue.async { [weak self] in
+                self?.writeFrameOnIOQueue(frame)
+            }
+
+            ioQueue.asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let timedOut = self.pendingRequests.removeValue(forKey: requestID)
+                self.stateLock.unlock()
+                timedOut?.resume(throwing: LSPClientError.timeout)
             }
         }
     }
 
+    private static func extractResult(from payload: Data) -> Any? {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+            return nil
+        }
+        return obj["result"]
+    }
+
     func initialize() async throws {
-        guard !isInitialized else { return }
+        if isInitialized { return }
         let rootURI = workspaceRoot.absoluteString
         let params: [String: Any] = [
             "processId": ProcessInfo.processInfo.processIdentifier,
@@ -446,8 +532,10 @@ final class LSPServerConnection: @unchecked Sendable {
             ]
         ]
 
-        _ = try await sendRequest(method: "initialize", params: params, timeoutSeconds: 12.0)
-        isInitialized = true
+        _ = try await sendRequestPayload(method: "initialize", params: params, timeoutSeconds: 12.0)
+        stateLock.withLock {
+            isInitializedFlag = true
+        }
         sendNotification(method: "initialized", params: [:])
     }
 
@@ -500,7 +588,7 @@ final class LSPServerConnection: @unchecked Sendable {
     }
 
     func completion(url: URL, line: Int, character: Int) async throws -> [LSPCompletionItem] {
-        let result = try await sendRequest(
+        let payload = try await sendRequestPayload(
             method: "textDocument/completion",
             params: [
                 "textDocument": ["uri": url.absoluteString],
@@ -508,11 +596,11 @@ final class LSPServerConnection: @unchecked Sendable {
             ],
             timeoutSeconds: 6.0
         )
-        return LSPPayloadParser.parseCompletionItems(from: result)
+        return LSPPayloadParser.parseCompletionItems(from: Self.extractResult(from: payload))
     }
 
     func definition(url: URL, line: Int, character: Int) async throws -> [LSPLocation] {
-        let result = try await sendRequest(
+        let payload = try await sendRequestPayload(
             method: "textDocument/definition",
             params: [
                 "textDocument": ["uri": url.absoluteString],
@@ -520,23 +608,32 @@ final class LSPServerConnection: @unchecked Sendable {
             ],
             timeoutSeconds: 4.0
         )
-        return LSPPayloadParser.parseLocations(from: result)
+        return LSPPayloadParser.parseLocations(from: Self.extractResult(from: payload))
     }
 
     func shutdownNow() {
-        ioQueue.sync {
-            guard !isClosed else { return }
-            isClosed = true
-            stdoutHandle.readabilityHandler = nil
-            stderrHandle.readabilityHandler = nil
-            let pending = pendingRequests
-            pendingRequests.removeAll()
-            for (_, cont) in pending {
-                cont.resume(throwing: LSPClientError.processNotRunning)
-            }
-            if process.isRunning {
-                process.terminate()
-            }
+        stateLock.lock()
+        guard !isClosedFlag else {
+            stateLock.unlock()
+            return
+        }
+        isClosedFlag = true
+        isInitializedFlag = false
+        let pending = pendingRequests
+        pendingRequests.removeAll()
+        diagnosticsCallback = nil
+        terminatedCallback = nil
+        stateLock.unlock()
+
+        stdoutHandle.readabilityHandler = nil
+        stderrHandle.readabilityHandler = nil
+        try? stdinHandle.close()
+
+        for (_, cont) in pending {
+            cont.resume(throwing: LSPClientError.processNotRunning)
+        }
+        if process.isRunning {
+            ProcessRunner.terminateProcessTree(rootPID: process.processIdentifier)
         }
     }
 }

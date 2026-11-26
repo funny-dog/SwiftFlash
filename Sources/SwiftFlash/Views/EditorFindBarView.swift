@@ -4,6 +4,7 @@ import SwiftUI
 struct EditorFindBarView: View {
     @ObservedObject var workspace: WorkspaceState
     @ObservedObject var findState: EditorFindState
+    @ObservedObject private var themeManager = ThemeManager.shared
     @FocusState private var focusedField: FocusField?
 
     private enum FocusField {
@@ -32,19 +33,31 @@ struct EditorFindBarView: View {
                 .fill(Color(nsColor: ZedTheme.border))
                 .frame(height: 1)
         }
+        .onAppear {
+            requestAppropriateFocus()
+        }
+        .onChange(of: findState.focusRequestNonce) { _, _ in
+            requestAppropriateFocus()
+        }
         .onChange(of: findState.isFindBarVisible) { _, visible in
             if visible {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-                    focusedField = .find
-                }
+                requestAppropriateFocus()
             }
         }
         .onChange(of: findState.isGoToLineVisible) { _, visible in
             if visible {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-                    focusedField = .goToLine
-                }
+                requestAppropriateFocus()
             }
+        }
+    }
+
+    private func requestAppropriateFocus() {
+        let target: FocusField? = findState.isGoToLineVisible
+            ? .goToLine
+            : (findState.isFindBarVisible ? .find : nil)
+        guard let target else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            focusedField = target
         }
     }
 
@@ -223,6 +236,7 @@ struct EditorFindBarView: View {
 
             iconButton(icon: "xmark", helpText: "ESC") {
                 findState.isGoToLineVisible = false
+                findState.goToLineInput = ""
                 workspace.onFocusEditorRequested?()
             }
         }

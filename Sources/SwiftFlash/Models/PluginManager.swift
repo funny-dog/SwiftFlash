@@ -10,6 +10,23 @@ enum PluginStorage {
         return appSupport
             .appendingPathComponent("SwiftFlash", isDirectory: true)
             .appendingPathComponent("Plugins", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    static func validatedPluginDirectory(id: String) -> URL? {
+        guard PluginManager.isValidPluginID(id) else { return nil }
+        let root = pluginsDirectory.standardizedFileURL
+        let candidate = root.appendingPathComponent(id, isDirectory: true).standardizedFileURL
+        guard candidate.path.hasPrefix(root.path + "/") else { return nil }
+        return candidate
+    }
+
+    static func validatedRelativeFile(_ relativePath: String, inside directory: URL) -> URL? {
+        guard !relativePath.isEmpty, !relativePath.hasPrefix("/") else { return nil }
+        let base = directory.standardizedFileURL
+        let candidate = base.appendingPathComponent(relativePath).standardizedFileURL
+        guard candidate.path.hasPrefix(base.path + "/") else { return nil }
+        return candidate
     }
 }
 
@@ -109,6 +126,19 @@ final class PluginManager: ObservableObject {
         reloadInstalledPlugins()
     }
 
+    /// Strict allowlist for plugin identifiers to prevent path traversal (`..`, `/`, etc.).
+    nonisolated static func isValidPluginID(_ id: String) -> Bool {
+        guard !id.isEmpty, id.count <= 128, !id.contains(".."), !id.hasPrefix("."), !id.hasSuffix(".") else {
+            return false
+        }
+        return id.unicodeScalars.allSatisfy { scalar in
+            (scalar.value >= 48 && scalar.value <= 57)     // 0-9
+                || (scalar.value >= 65 && scalar.value <= 90)  // A-Z
+                || (scalar.value >= 97 && scalar.value <= 122) // a-z
+                || scalar == "." || scalar == "_" || scalar == "-"
+        }
+    }
+
     var installedLanguagePlugins: [InstalledPlugin] {
         installedPlugins.filter { $0.manifest.type == .language }
     }
@@ -142,7 +172,8 @@ final class PluginManager: ObservableObject {
             guard isDir else { continue }
             let manifestURL = dir.appendingPathComponent("manifest.json")
             guard let data = try? Data(contentsOf: manifestURL),
-                  let manifest = try? decoder.decode(PluginManifest.self, from: data) else {
+                  let manifest = try? decoder.decode(PluginManifest.self, from: data),
+                  Self.isValidPluginID(manifest.id) else {
                 continue
             }
             loaded.append(InstalledPlugin(id: manifest.id, manifest: manifest, installURL: dir))
@@ -158,7 +189,7 @@ final class PluginManager: ObservableObject {
         do {
             let data = try await downloadData(from: registryURL)
             let decoded = try JSONDecoder().decode(PluginRegistryIndex.self, from: data)
-            remotePlugins = decoded.plugins
+            remotePlugins = decoded.plugins.filter { Self.isValidPluginID($0.id) }
         } catch let err as PluginError {
             registryError = err.localizedDescription
         } catch {
@@ -168,6 +199,10 @@ final class PluginManager: ObservableObject {
 
     @discardableResult
     func installPlugin(_ entry: RemotePluginEntry, activateIfLanguage: Bool = true) async -> Bool {
+        guard Self.isValidPluginID(entry.id) else {
+            registryError = PluginError.invalidPluginPackage("Invalid plugin ID: \(entry.id)").localizedDescription
+            return false
+        }
         guard !installingPluginIDs.contains(entry.id) else { return false }
         installingPluginIDs.insert(entry.id)
         registryError = nil
@@ -178,20 +213,21 @@ final class PluginManager: ObservableObject {
                 throw PluginError.invalidURL(entry.archiveURL)
             }
 
-            let archiveData = try await downloadData(from: archiveURL)
-
-            if let expectedSHA = entry.sha256?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-               !expectedSHA.isEmpty {
-                let actualSHA = SHA256.hash(data: archiveData).map { String(format: "%02x", $0) }.joined()
-                guard actualSHA == expectedSHA else {
-                    throw PluginError.checksumMismatch(expected: expectedSHA, actual: actualSHA)
-                }
+            let expectedSHA = entry.sha256?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            guard !expectedSHA.isEmpty else {
+                throw PluginError.missingChecksum(entry.id)
             }
 
-            let manifest = try Self.stageAndInstallZip(
-                data: archiveData,
-                expectedID: entry.id
-            )
+            let archiveData = try await downloadData(from: archiveURL)
+            let actualSHA = SHA256.hash(data: archiveData).map { String(format: "%02x", $0) }.joined()
+            guard actualSHA == expectedSHA else {
+                throw PluginError.checksumMismatch(expected: expectedSHA, actual: actualSHA)
+            }
+
+            let expectedID = entry.id
+            let manifest = try await Task.detached(priority: .userInitiated) {
+                try Self.stageAndInstallZip(data: archiveData, expectedID: expectedID)
+            }.value
             reloadInstalledPlugins()
 
             if activateIfLanguage && manifest.type == .language {
@@ -208,7 +244,7 @@ final class PluginManager: ObservableObject {
     }
 
     func uninstallPlugin(id: String) {
-        let targetDir = PluginStorage.pluginsDirectory.appendingPathComponent(id, isDirectory: true)
+        guard let targetDir = PluginStorage.validatedPluginDirectory(id: id) else { return }
         try? FileManager.default.removeItem(at: targetDir)
         reloadInstalledPlugins()
 
@@ -233,6 +269,11 @@ final class PluginManager: ObservableObject {
     // MARK: - Extraction & Validation
 
     private nonisolated static func stageAndInstallZip(data: Data, expectedID: String) throws -> PluginManifest {
+        guard isValidPluginID(expectedID),
+              let destDir = PluginStorage.validatedPluginDirectory(id: expectedID) else {
+            throw PluginError.invalidPluginPackage("Invalid plugin ID: \(expectedID)")
+        }
+
         let fm = FileManager.default
         let tempRoot = fm.temporaryDirectory.appendingPathComponent("swiftflash-plugin-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
@@ -244,17 +285,13 @@ final class PluginManager: ObservableObject {
         let extractDir = tempRoot.appendingPathComponent("extracted", isDirectory: true)
         try fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        proc.arguments = ["-xk", zipURL.path, extractDir.path]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-
-        guard proc.terminationStatus == 0 else {
-            let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw PluginError.unzipFailed(errText)
+        let extractRes = ProcessRunner.run(
+            executablePath: "/usr/bin/ditto",
+            arguments: ["-xk", zipURL.path, extractDir.path],
+            timeoutSeconds: 60
+        )
+        guard extractRes.exitCode == 0 else {
+            throw PluginError.unzipFailed(extractRes.stderr)
         }
 
         // Locate manifest.json either at root or inside a single nested folder
@@ -272,7 +309,7 @@ final class PluginManager: ObservableObject {
 
         let manifestData = try Data(contentsOf: pluginSourceDir.appendingPathComponent("manifest.json"))
         let manifest = try JSONDecoder().decode(PluginManifest.self, from: manifestData)
-        guard manifest.id == expectedID else {
+        guard manifest.id == expectedID, isValidPluginID(manifest.id) else {
             throw PluginError.invalidPluginPackage("Plugin ID mismatch: \(manifest.id)")
         }
 
@@ -280,7 +317,9 @@ final class PluginManager: ObservableObject {
             guard let loc = manifest.contributes?.localization else {
                 throw PluginError.invalidPluginPackage("Missing localization contribution")
             }
-            let stringsURL = pluginSourceDir.appendingPathComponent(loc.stringsFile)
+            guard let stringsURL = PluginStorage.validatedRelativeFile(loc.stringsFile, inside: pluginSourceDir) else {
+                throw PluginError.invalidPluginPackage("Invalid stringsFile path: \(loc.stringsFile)")
+            }
             guard let stringsData = try? Data(contentsOf: stringsURL),
                   (try? JSONDecoder().decode([String: String].self, from: stringsData)) != nil else {
                 throw PluginError.invalidPluginPackage("Invalid \(loc.stringsFile)")
@@ -289,7 +328,6 @@ final class PluginManager: ObservableObject {
 
         let pluginsRoot = PluginStorage.pluginsDirectory
         try fm.createDirectory(at: pluginsRoot, withIntermediateDirectories: true)
-        let destDir = pluginsRoot.appendingPathComponent(manifest.id, isDirectory: true)
         if fm.fileExists(atPath: destDir.path) {
             try fm.removeItem(at: destDir)
         }
@@ -301,6 +339,7 @@ final class PluginManager: ObservableObject {
 enum PluginError: LocalizedError {
     case invalidURL(String)
     case httpStatus(Int, String)
+    case missingChecksum(String)
     case checksumMismatch(expected: String, actual: String)
     case unzipFailed(String)
     case invalidPluginPackage(String)
@@ -311,6 +350,8 @@ enum PluginError: LocalizedError {
             return "Invalid URL: \(url)"
         case .httpStatus(let code, let file):
             return "HTTP \(code) while downloading \(file)"
+        case .missingChecksum(let id):
+            return "Plugin package \(id) is missing required SHA-256 checksum"
         case .checksumMismatch:
             return "Plugin package SHA-256 verification failed"
         case .unzipFailed(let msg):

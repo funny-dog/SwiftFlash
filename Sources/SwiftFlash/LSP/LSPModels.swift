@@ -24,15 +24,6 @@ enum LSPDiagnosticSeverity: Int, Codable, Equatable, Hashable, Sendable {
     case information = 3
     case hint = 4
 
-    var label: String {
-        switch self {
-        case .error: return "Error"
-        case .warning: return "Warning"
-        case .information: return "Info"
-        case .hint: return "Hint"
-        }
-    }
-
     var iconName: String {
         switch self {
         case .error: return "xmark.circle.fill"
@@ -63,7 +54,7 @@ struct LSPDiagnostic: Identifiable, Codable, Equatable, Hashable, Sendable {
     let message: String
 }
 
-struct WorkspaceDiagnosticEntry: Identifiable, Equatable {
+struct WorkspaceDiagnosticEntry: Identifiable, Equatable, Sendable {
     var id: String { "\(fileURL.path):\(diagnostic.id)" }
     let fileURL: URL
     let relativePath: String
@@ -166,7 +157,6 @@ struct LSPServerDefinition: Identifiable, Equatable, Sendable {
     let languageSummary: String
     let executableName: String
     let arguments: [String]
-    let lspLanguageIDs: [String]
     let installStrategy: LSPInstallStrategy
     let manualInstallHint: String
 }
@@ -206,7 +196,6 @@ enum LSPServerCatalog {
             languageSummary: "Swift / C / Objective-C",
             executableName: "sourcekit-lsp",
             arguments: [],
-            lspLanguageIDs: ["swift"],
             installStrategy: .systemToolchain(xcrunTool: "sourcekit-lsp"),
             manualInstallHint: "xcode-select --install"
         ),
@@ -216,7 +205,6 @@ enum LSPServerCatalog {
             languageSummary: "Rust",
             executableName: "rust-analyzer",
             arguments: [],
-            lspLanguageIDs: ["rust"],
             installStrategy: .githubGzipBinary(
                 url: "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-aarch64-apple-darwin.gz",
                 sha256: nil
@@ -229,7 +217,6 @@ enum LSPServerCatalog {
             languageSummary: "C / C++",
             executableName: "clangd",
             arguments: ["--background-index"],
-            lspLanguageIDs: ["c", "cpp"],
             installStrategy: .githubLatestZipBinary(
                 repo: "clangd/clangd",
                 assetPrefix: "clangd-mac-",
@@ -243,7 +230,6 @@ enum LSPServerCatalog {
             languageSummary: "TypeScript / JavaScript",
             executableName: "typescript-language-server",
             arguments: ["--stdio"],
-            lspLanguageIDs: ["typescript", "javascript"],
             installStrategy: .npmPackages(
                 packages: ["typescript-language-server", "typescript"],
                 binaryName: "typescript-language-server"
@@ -256,7 +242,6 @@ enum LSPServerCatalog {
             languageSummary: "Python",
             executableName: "pyright-langserver",
             arguments: ["--stdio"],
-            lspLanguageIDs: ["python"],
             installStrategy: .npmPackages(
                 packages: ["pyright"],
                 binaryName: "pyright-langserver"
@@ -269,7 +254,6 @@ enum LSPServerCatalog {
             languageSummary: "Go",
             executableName: "gopls",
             arguments: ["serve"],
-            lspLanguageIDs: ["go"],
             installStrategy: .goInstall(
                 packagePath: "golang.org/x/tools/gopls@latest",
                 binaryName: "gopls"

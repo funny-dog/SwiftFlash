@@ -19,7 +19,7 @@ struct GlobalSearchView: View {
                         .foregroundColor(Color(nsColor: ZedTheme.primaryText))
                         .focused($isSearchFocused)
                         .onSubmit {
-                            workspace.performGlobalSearch(query: workspace.searchQuery)
+                            workspace.performGlobalSearch(query: workspace.searchQuery, debounceMs: 0)
                         }
                         .onChange(of: workspace.searchQuery) { _, newValue in
                             workspace.performGlobalSearch(query: newValue)
@@ -28,7 +28,6 @@ struct GlobalSearchView: View {
                     if !workspace.searchQuery.isEmpty {
                         Button {
                             workspace.searchQuery = ""
-                            workspace.searchResults = []
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 11))
@@ -83,9 +82,16 @@ struct GlobalSearchView: View {
             }
         }
         .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                isSearchFocused = true
-            }
+            requestFocus()
+        }
+        .onChange(of: workspace.searchFocusNonce) { _, _ in
+            requestFocus()
+        }
+    }
+
+    private func requestFocus() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            isSearchFocused = true
         }
     }
 }
@@ -93,6 +99,7 @@ struct GlobalSearchView: View {
 private struct SearchMatchRow: View {
     let match: SearchMatch
     let onTap: () -> Void
+    @ObservedObject private var themeManager = ThemeManager.shared
     @State private var isHovered = false
 
     var body: some View {

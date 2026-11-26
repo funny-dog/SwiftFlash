@@ -4,6 +4,47 @@ import SwiftUI
 // MARK: - Local Completion & Merge Provider
 
 enum LocalCompletionProvider {
+    private static let fromImportRegex = try! NSRegularExpression(
+        pattern: #"^\s*from\s+([A-Za-z_]\w*)\s+import\s+(?:\(?\s*(?:\w+\s*(?:as\s+\w+\s*)?,\s*)*)(\w*)$"#
+    )
+    private static let modRegex = try! NSRegularExpression(
+        pattern: #"^\s*(?:import|from)\s+(?:\w+\s*,\s*)*(\w*)$"#
+    )
+    private static let fromWordRegex = try! NSRegularExpression(
+        pattern: #"^\s*from\s+\w+\s+\w"#
+    )
+    private static let memberRegex = try! NSRegularExpression(
+        pattern: #"((?:[A-Za-z_]\w*\s*\.\s*)*[A-Za-z_]\w*|[)\]])\s*\.\s*(\w*)$"#
+    )
+    private static let identifierRegex = try! NSRegularExpression(
+        pattern: #"\b[A-Za-z_][A-Za-z0-9_]{1,63}\b"#
+    )
+    private static let pythonDefRegex = try! NSRegularExpression(
+        pattern: #"^\s*def\s+([A-Za-z_]\w*)"#,
+        options: .anchorsMatchLines
+    )
+
+    private final class IdentifierCacheBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var key: String = ""
+        private var cached: [String] = []
+
+        func lookup(key: String) -> [String]? {
+            lock.lock()
+            defer { lock.unlock() }
+            return self.key == key ? cached : nil
+        }
+
+        func store(key: String, identifiers: [String]) {
+            lock.lock()
+            self.key = key
+            self.cached = identifiers
+            lock.unlock()
+        }
+    }
+
+    private static let identifierCache = IdentifierCacheBox()
+
     static func identifierPrefixRange(in nsString: NSString, at cursorOffset: Int) -> NSRange {
         let clamped = max(0, min(cursorOffset, nsString.length))
         var start = clamped
@@ -26,54 +67,9 @@ enum LocalCompletionProvider {
     }
 
     static func keywords(for language: CodeLanguage) -> [String] {
-        switch language {
-        case .swift:
-            return [
-                "import", "struct", "class", "enum", "protocol", "extension", "func", "let", "var",
-                "guard", "if", "else", "switch", "case", "default", "for", "while", "repeat",
-                "return", "throw", "throws", "try", "catch", "async", "await", "actor",
-                "private", "fileprivate", "internal", "public", "open", "static", "final",
-                "override", "init", "deinit", "self", "Self", "super", "nil", "true", "false",
-                "where", "typealias", "associatedtype", "in", "is", "as", "weak", "unowned",
-                "@MainActor", "@Published", "@State", "@ObservedObject", "@Sendable"
-            ]
-        case .rust:
-            return [
-                "fn", "let", "mut", "const", "static", "struct", "enum", "impl", "trait", "pub",
-                "use", "mod", "crate", "self", "super", "match", "if", "else", "for", "while",
-                "loop", "return", "break", "continue", "async", "await", "move", "where", "type",
-                "Some", "None", "Ok", "Err", "Result", "Option", "Vec", "String"
-            ]
-        case .python:
-            return [
-                "def", "class", "import", "from", "as", "if", "elif", "else", "for", "while",
-                "try", "except", "finally", "with", "return", "yield", "async", "await",
-                "lambda", "pass", "break", "continue", "raise", "assert", "None", "True", "False",
-                "self", "cls", "print", "len", "range", "enumerate", "isinstance"
-            ]
-        case .typescript, .javascript:
-            return [
-                "import", "export", "from", "default", "function", "const", "let", "var",
-                "class", "interface", "type", "enum", "implements", "extends", "return",
-                "if", "else", "switch", "case", "for", "while", "try", "catch", "finally",
-                "async", "await", "new", "this", "null", "undefined", "true", "false",
-                "Promise", "Array", "Record", "Partial", "console"
-            ]
-        case .go:
-            return [
-                "package", "import", "func", "type", "struct", "interface", "var", "const",
-                "if", "else", "switch", "case", "default", "for", "range", "return", "go",
-                "defer", "select", "chan", "map", "make", "len", "cap", "append", "nil", "true", "false", "error"
-            ]
-        case .c:
-            return [
-                "include", "define", "struct", "typedef", "enum", "union", "void", "int",
-                "char", "long", "double", "float", "bool", "const", "static", "extern",
-                "if", "else", "switch", "case", "for", "while", "do", "return", "sizeof", "NULL", "nullptr"
-            ]
-        default:
-            return []
-        }
+        let base = Array(LanguageKeywords.keywordSet(for: language))
+        let extras = LanguageKeywords.completionExtras(for: language)
+        return (base + extras).sorted()
     }
 
     enum PythonLineContext: Equatable {
@@ -175,25 +171,17 @@ enum LocalCompletionProvider {
         let ns = beforeCursorOnLine as NSString
         let fullRange = NSRange(location: 0, length: ns.length)
 
-        if let fromImportRegex = try? NSRegularExpression(
-            pattern: #"^\s*from\s+([A-Za-z_]\w*)\s+import\s+(?:\(?\s*(?:\w+\s*(?:as\s+\w+\s*)?,\s*)*)(\w*)$"#
-        ), let match = fromImportRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) {
+        if let match = fromImportRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) {
             let modName = ns.substring(with: match.range(at: 1))
             return .importMembers(module: modName)
         }
 
-        if let modRegex = try? NSRegularExpression(
-            pattern: #"^\s*(?:import|from)\s+(?:\w+\s*,\s*)*(\w*)$"#
-        ), let _ = modRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) {
-            let fromWordRegex = try? NSRegularExpression(pattern: #"^\s*from\s+\w+\s+\w"#)
-            if fromWordRegex?.firstMatch(in: beforeCursorOnLine, range: fullRange) == nil {
-                return .importModules
-            }
+        if modRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) != nil,
+           fromWordRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) == nil {
+            return .importModules
         }
 
-        if let memberRegex = try? NSRegularExpression(
-            pattern: #"((?:[A-Za-z_]\w*\s*\.\s*)*[A-Za-z_]\w*|[)\]])\s*\.\s*(\w*)$"#
-        ), let match = memberRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) {
+        if let match = memberRegex.firstMatch(in: beforeCursorOnLine, range: fullRange) {
             let rawChain = ns.substring(with: match.range(at: 1))
             let parts = rawChain.split(separator: ".").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             let target = parts.last ?? rawChain
@@ -212,15 +200,19 @@ enum LocalCompletionProvider {
         var i = 0
         var inSingleQuote = false
         var inDoubleQuote = false
+        var inTripleDouble = false
+        var inTripleSingle = false
         var inLineComment = false
         var inBlockComment = false
         var escaped = false
 
         let usesHashComment = (language == .python || language == .shell || language == .yaml || language == .toml)
+        let usesTripleQuotes = (language == .python || language == .swift)
 
         while i < n {
             let ch = scalars[i]
             let next: UnicodeScalar? = (i + 1 < n) ? scalars[i + 1] : nil
+            let next2: UnicodeScalar? = (i + 2 < n) ? scalars[i + 2] : nil
 
             if inLineComment {
                 if ch == "\n" {
@@ -240,6 +232,40 @@ enum LocalCompletionProvider {
                 }
                 continue
             }
+            if inTripleDouble {
+                if escaped {
+                    escaped = false
+                    i += 1
+                } else if ch == "\\" {
+                    escaped = true
+                    i += 1
+                } else if ch == "\"" && next == "\"" && next2 == "\"" {
+                    inTripleDouble = false
+                    output.append(" ")
+                    i += 3
+                } else {
+                    if ch == "\n" { output.unicodeScalars.append(ch) }
+                    i += 1
+                }
+                continue
+            }
+            if inTripleSingle {
+                if escaped {
+                    escaped = false
+                    i += 1
+                } else if ch == "\\" {
+                    escaped = true
+                    i += 1
+                } else if ch == "'" && next == "'" && next2 == "'" {
+                    inTripleSingle = false
+                    output.append(" ")
+                    i += 3
+                } else {
+                    if ch == "\n" { output.unicodeScalars.append(ch) }
+                    i += 1
+                }
+                continue
+            }
             if inSingleQuote {
                 if escaped {
                     escaped = false
@@ -249,6 +275,7 @@ enum LocalCompletionProvider {
                     inSingleQuote = false
                     output.append(" ")
                 } else if ch == "\n" {
+                    inSingleQuote = false
                     output.unicodeScalars.append(ch)
                 }
                 i += 1
@@ -263,6 +290,7 @@ enum LocalCompletionProvider {
                     inDoubleQuote = false
                     output.append(" ")
                 } else if ch == "\n" {
+                    inDoubleQuote = false
                     output.unicodeScalars.append(ch)
                 }
                 i += 1
@@ -282,6 +310,16 @@ enum LocalCompletionProvider {
             if !usesHashComment && ch == "/" && next == "*" {
                 inBlockComment = true
                 i += 2
+                continue
+            }
+            if usesTripleQuotes && ch == "\"" && next == "\"" && next2 == "\"" {
+                inTripleDouble = true
+                i += 3
+                continue
+            }
+            if language == .python && ch == "'" && next == "'" && next2 == "'" {
+                inTripleSingle = true
+                i += 3
                 continue
             }
             if ch == "'" {
@@ -307,23 +345,34 @@ enum LocalCompletionProvider {
         language: CodeLanguage = .plainText
     ) -> [String] {
         guard !text.isEmpty else { return [] }
-        let limited = text.count > 120_000 ? String(text.prefix(120_000)) : text
-        let sanitized = stripStringsAndComments(from: limited, language: language)
-        guard let regex = try? NSRegularExpression(pattern: #"\b[A-Za-z_][A-Za-z0-9_]{1,63}\b"#) else {
-            return []
+        let limited = text.count > 80_000 ? String(text.prefix(80_000)) : text
+        let cacheKey = "\(language.rawValue)|\(limited.utf8.count)|\(limited.hashValue)"
+
+        let allIdentifiers: [String]
+        if let hit = identifierCache.lookup(key: cacheKey) {
+            allIdentifiers = hit
+        } else {
+            let sanitized = stripStringsAndComments(from: limited, language: language)
+            let nsSanitized = sanitized as NSString
+            let matches = identifierRegex.matches(in: sanitized, range: NSRange(location: 0, length: nsSanitized.length))
+            var seen = Set<String>()
+            var collected: [String] = []
+            collected.reserveCapacity(min(600, matches.count))
+            for m in matches {
+                let word = nsSanitized.substring(with: m.range)
+                if seen.insert(word).inserted {
+                    collected.append(word)
+                    if collected.count >= 600 { break }
+                }
+            }
+            identifierCache.store(key: cacheKey, identifiers: collected)
+            allIdentifiers = collected
         }
-        let nsSanitized = sanitized as NSString
-        let matches = regex.matches(in: sanitized, range: NSRange(location: 0, length: nsSanitized.length))
-        var seen = Set<String>()
-        var result: [String] = []
-        for m in matches {
-            let word = nsSanitized.substring(with: m.range)
-            if word == exactPrefix || seen.contains(word) { continue }
-            seen.insert(word)
-            result.append(word)
-            if result.count >= 600 { break }
+
+        if exactPrefix.isEmpty {
+            return allIdentifiers
         }
-        return result
+        return allIdentifiers.filter { $0 != exactPrefix }
     }
 
     private static func inferPythonVariableType(for name: String, in text: String, viaSelf: Bool) -> String? {
@@ -349,26 +398,26 @@ enum LocalCompletionProvider {
     }
 
     private static func classifyPythonExprType(_ expr: String) -> String? {
-        let lower = expr.trimmingCharacters(in: .whitespacesAndNewlines)
-        if lower.hasPrefix("List[") || lower.hasPrefix("list[") || lower.hasPrefix("list(") || lower.hasPrefix("sorted(") || lower.hasPrefix("[") {
+        let trimmed = expr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("List[") || trimmed.hasPrefix("list[") || trimmed.hasPrefix("list(") || trimmed.hasPrefix("sorted(") || trimmed.hasPrefix("[") {
             return "list"
         }
-        if lower.hasPrefix("DefaultDict[") || lower.hasPrefix("defaultdict(") || lower.hasPrefix("collections.defaultdict(") {
+        if trimmed.hasPrefix("DefaultDict[") || trimmed.hasPrefix("defaultdict(") || trimmed.hasPrefix("collections.defaultdict(") {
             return "defaultdict"
         }
-        if lower.hasPrefix("Counter") || lower.hasPrefix("collections.Counter") {
+        if trimmed.hasPrefix("Counter") || trimmed.hasPrefix("collections.Counter") {
             return "Counter"
         }
-        if lower.hasPrefix("Deque") || lower.hasPrefix("deque(") || lower.hasPrefix("collections.deque(") {
+        if trimmed.hasPrefix("Deque") || trimmed.hasPrefix("deque(") || trimmed.hasPrefix("collections.deque(") {
             return "deque"
         }
-        if lower.hasPrefix("Dict[") || lower.hasPrefix("dict[") || lower.hasPrefix("dict(") || lower == "{}" {
+        if trimmed.hasPrefix("Dict[") || trimmed.hasPrefix("dict[") || trimmed.hasPrefix("dict(") || trimmed == "{}" {
             return "dict"
         }
-        if lower.hasPrefix("Set[") || lower.hasPrefix("set[") || lower.hasPrefix("set(") {
+        if trimmed.hasPrefix("Set[") || trimmed.hasPrefix("set[") || trimmed.hasPrefix("set(") {
             return "set"
         }
-        if lower.hasPrefix("\"") || lower.hasPrefix("'") || lower.hasPrefix("str(") {
+        if trimmed.hasPrefix("\"") || trimmed.hasPrefix("'") || trimmed.hasPrefix("str(") {
             return "str"
         }
         return nil
@@ -390,7 +439,6 @@ enum LocalCompletionProvider {
             : .general
 
         for item in lspItems {
-            // Inside Python `import` statements, filter out unrelated keywords/builtins if LSP echoed them
             if case .importModules = pythonContext, item.kind == .keyword {
                 continue
             }
@@ -431,16 +479,14 @@ enum LocalCompletionProvider {
 
         case .memberAccess(let target, let viaSelf):
             if target == "self" {
-                if let defRegex = try? NSRegularExpression(pattern: #"^\s*def\s+([A-Za-z_]\w*)"#, options: .anchorsMatchLines) {
-                    let ns = documentText as NSString
-                    for m in defRegex.matches(in: documentText, range: NSRange(location: 0, length: ns.length)) {
-                        let name = ns.substring(with: m.range(at: 1))
-                        if !name.hasPrefix("__"), seenLabels.insert(name).inserted {
-                            combined.append(LSPCompletionItem(
-                                label: name, kind: .method, detail: "self", documentation: nil,
-                                insertText: name, filterText: name, sortText: "zm_\(name)", isLocalFallback: true
-                            ))
-                        }
+                let ns = documentText as NSString
+                for m in pythonDefRegex.matches(in: documentText, range: NSRange(location: 0, length: ns.length)) {
+                    let name = ns.substring(with: m.range(at: 1))
+                    if !name.hasPrefix("__"), seenLabels.insert(name).inserted {
+                        combined.append(LSPCompletionItem(
+                            label: name, kind: .method, detail: "self", documentation: nil,
+                            insertText: name, filterText: name, sortText: "zm_\(name)", isLocalFallback: true
+                        ))
                     }
                 }
             } else if let modMembers = pythonModuleMembers[target] {
@@ -490,39 +536,38 @@ enum LocalCompletionProvider {
         }
 
         let trimmed = prefix.trimmingCharacters(in: .whitespaces)
-        let filtered: [LSPCompletionItem]
-        if trimmed.isEmpty {
-            filtered = combined
+        let lowerPrefix = trimmed.lowercased()
+
+        // Schwartzian transform: compute matchRank once per candidate instead of O(N log N) times.
+        let scored: [(item: LSPCompletionItem, rank: Int)]
+        if lowerPrefix.isEmpty {
+            scored = combined.map { ($0, 0) }
         } else {
-            let lower = trimmed.lowercased()
-            filtered = combined.filter { item in
-                matchRank(for: item, trimmedPrefix: trimmed, lowerPrefix: lower) != nil
+            scored = combined.compactMap { item in
+                guard let rank = matchRank(for: item, trimmedPrefix: trimmed, lowerPrefix: lowerPrefix) else {
+                    return nil
+                }
+                return (item, rank)
             }
         }
 
-        let lowerPrefix = trimmed.lowercased()
-        let ranked = filtered.sorted { lhs, rhs in
-            if !lowerPrefix.isEmpty {
-                let lScore = matchRank(for: lhs, trimmedPrefix: trimmed, lowerPrefix: lowerPrefix) ?? Int.max
-                let rScore = matchRank(for: rhs, trimmedPrefix: trimmed, lowerPrefix: lowerPrefix) ?? Int.max
-                if lScore != rScore { return lScore < rScore }
-            }
+        let ranked = scored.sorted { lhs, rhs in
+            if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
 
-            // Within the same match quality tier, prefer LSP results over local fallback
-            let lhsLSP = !lhs.isLocalFallback
-            let rhsLSP = !rhs.isLocalFallback
+            let lhsLSP = !lhs.item.isLocalFallback
+            let rhsLSP = !rhs.item.isLocalFallback
             if lhsLSP != rhsLSP { return lhsLSP }
 
-            if lhs.sortText != rhs.sortText {
-                return lhs.sortText < rhs.sortText
+            if lhs.item.sortText != rhs.item.sortText {
+                return lhs.item.sortText < rhs.item.sortText
             }
-            if lhs.label.count != rhs.label.count {
-                return lhs.label.count < rhs.label.count
+            if lhs.item.label.count != rhs.item.label.count {
+                return lhs.item.label.count < rhs.item.label.count
             }
-            return lhs.label < rhs.label
+            return lhs.item.label < rhs.item.label
         }
 
-        return Array(ranked.prefix(maxItems))
+        return Array(ranked.prefix(maxItems).map(\.item))
     }
 
     /// Lower score = better match; nil = does not match prefix well enough to show.
@@ -561,20 +606,34 @@ enum LocalCompletionProvider {
         return nil
     }
 
-    private static func hasWordBoundaryPrefix(in text: String, lowerPrefix: String) -> Bool {
-        let lowerText = text.lowercased()
-        var searchStart = lowerText.startIndex
-        while let range = lowerText.range(of: lowerPrefix, range: searchStart..<lowerText.endIndex) {
-            if range.lowerBound == lowerText.startIndex {
+    /// Unicode-safe word boundary check operating strictly on original `text` indices.
+    static func hasWordBoundaryPrefix(in text: String, lowerPrefix: String) -> Bool {
+        guard !lowerPrefix.isEmpty else { return true }
+        let chars = Array(text)
+        guard !chars.isEmpty else { return false }
+
+        for i in 0..<chars.count {
+            let isBoundary: Bool
+            if i == 0 {
+                isBoundary = true
+            } else {
+                let prev = chars[i - 1]
+                let cur = chars[i]
+                isBoundary = prev == "_" || prev == "." || (prev.isLowercase && cur.isUppercase)
+            }
+            guard isBoundary else { continue }
+
+            // Check if the remainder starting at `i` starts with `lowerPrefix` case-insensitively.
+            var remaining = ""
+            remaining.reserveCapacity(lowerPrefix.count + 4)
+            var j = i
+            while j < chars.count && remaining.count < lowerPrefix.count {
+                remaining.append(chars[j].lowercased())
+                j += 1
+            }
+            if remaining.hasPrefix(lowerPrefix) {
                 return true
             }
-            let prevIdx = lowerText.index(before: range.lowerBound)
-            let prevChar = text[prevIdx]
-            let matchedStartChar = text[range.lowerBound]
-            if prevChar == "_" || prevChar == "." || (prevChar.isLowercase && matchedStartChar.isUppercase) {
-                return true
-            }
-            searchStart = range.upperBound
         }
         return false
     }
@@ -627,6 +686,7 @@ final class CompletionState: ObservableObject {
 
 struct CompletionPopupView: View {
     @ObservedObject var state: CompletionState
+    @ObservedObject private var themeManager = ThemeManager.shared
     let onAccept: (LSPCompletionItem) -> Void
 
     var body: some View {

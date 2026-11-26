@@ -2,12 +2,14 @@ import SwiftUI
 
 struct StatusBarView: View {
     @ObservedObject var workspace: WorkspaceState
+    @ObservedObject private var editorStatus: EditorStatusModel
     @ObservedObject private var taskRunner: TaskRunnerState
     @ObservedObject private var themeManager = ThemeManager.shared
     @ObservedObject private var lspManager = LSPManager.shared
 
     init(workspace: WorkspaceState) {
         self.workspace = workspace
+        self.editorStatus = workspace.editorStatus
         self.taskRunner = workspace.taskRunner
     }
 
@@ -114,13 +116,13 @@ struct StatusBarView: View {
                     .foregroundColor(Color(nsColor: ZedTheme.secondaryText))
             }
 
-            if workspace.lastRenderLatencyMs > 0 {
-                Text(String(format: "%.2f ms", workspace.lastRenderLatencyMs))
+            if editorStatus.lastRenderLatencyMs > 0 {
+                Text(String(format: "%.2f ms", editorStatus.lastRenderLatencyMs))
                     .font(.system(size: 10.5, design: .monospaced))
                     .foregroundColor(Color(nsColor: ZedTheme.operatorColor))
             }
 
-            Text(workspace.statusMessage)
+            Text(editorStatus.statusMessage)
                 .font(.system(size: 11))
                 .foregroundColor(Color(nsColor: ZedTheme.mutedText))
                 .lineLimit(1)
@@ -161,7 +163,7 @@ struct StatusBarView: View {
                     .frame(height: 11)
                     .overlay(Color(nsColor: ZedTheme.border))
 
-                Text(L10n("statusbar.cursorFormat", tab.cursorLine, tab.cursorColumn))
+                Text(L10n("statusbar.cursorFormat", editorStatus.cursorLine, editorStatus.cursorColumn))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(Color(nsColor: ZedTheme.primaryText))
 
@@ -272,19 +274,16 @@ private struct ZedFileTreeDockIcon: View {
             let sx = w / 16.0
             let sy = h / 16.0
 
-            // Left vertical trunk
             var trunk = Path()
             trunk.move(to: CGPoint(x: 2.6 * sx, y: 2.8 * sy))
             trunk.addLine(to: CGPoint(x: 2.6 * sx, y: 13.0 * sy))
 
-            // Upper curved branch
             trunk.move(to: CGPoint(x: 2.6 * sx, y: 4.5 * sy))
             trunk.addQuadCurve(
                 to: CGPoint(x: 5.2 * sx, y: 5.1 * sy),
                 control: CGPoint(x: 3.9 * sx, y: 5.1 * sy)
             )
 
-            // Lower curved branch
             trunk.move(to: CGPoint(x: 2.6 * sx, y: 10.6 * sy))
             trunk.addQuadCurve(
                 to: CGPoint(x: 5.2 * sx, y: 11.2 * sy),
@@ -297,7 +296,6 @@ private struct ZedFileTreeDockIcon: View {
                 style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round)
             )
 
-            // Two solid rounded pills on the right
             let topPill = Path(
                 roundedRect: CGRect(x: 6.4 * sx, y: 3.1 * sy, width: 7.1 * sx, height: 3.9 * sy),
                 cornerRadius: 1.7
@@ -325,12 +323,10 @@ private struct ZedGitDockIcon: View {
 
             let strokeStyle = StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round)
 
-            // Vertical stem stopping at top edge of bottom hollow circle
             var lines = Path()
             lines.move(to: CGPoint(x: 4.4 * sx, y: 2.7 * sy))
             lines.addLine(to: CGPoint(x: 4.4 * sx, y: 10.4 * sy))
 
-            // Curved branch from stem to left edge of top-right hollow circle
             lines.move(to: CGPoint(x: 4.4 * sx, y: 9.4 * sy))
             lines.addQuadCurve(
                 to: CGPoint(x: 9.6 * sx, y: 5.6 * sy),
@@ -338,13 +334,11 @@ private struct ZedGitDockIcon: View {
             )
             context.stroke(lines, with: .color(color), style: strokeStyle)
 
-            // Bottom hollow circle
             let bottomCircle = Path(
                 ellipseIn: CGRect(x: 2.6 * sx, y: 10.4 * sy, width: 3.6 * sx, height: 3.6 * sy)
             )
             context.stroke(bottomCircle, with: .color(color), style: strokeStyle)
 
-            // Top-right hollow circle
             let topRightCircle = Path(
                 ellipseIn: CGRect(x: 9.6 * sx, y: 3.8 * sy, width: 3.6 * sx, height: 3.6 * sy)
             )

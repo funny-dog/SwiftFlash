@@ -1,340 +1,53 @@
 import AppKit
-import CodeEditTextView
+@preconcurrency import CodeEditTextView
 import Combine
-import CoreText
 import SwiftUI
 
-// MARK: - FlashTextView (Enhanced CodeEditTextView)
+private final class EditorResourceBag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observers: [NSObjectProtocol] = []
+    private var keyMonitor: Any?
 
-final class FlashTextView: TextView {
-    var currentLanguage: CodeLanguage = .swift
+    func addObserver(_ token: NSObjectProtocol) {
+        lock.lock()
+        observers.append(token)
+        lock.unlock()
+    }
 
-    private let autoPairs: [Character: Character] = [
-        "(": ")",
-        "[": "]",
-        "{": "}",
-        "\"": "\"",
-        "'": "'"
-    ]
-    private let closingPairs: Set<Character> = [")", "]", "}", "\"", "'"]
+    func setKeyMonitor(_ monitor: Any?) {
+        lock.lock()
+        let previous = keyMonitor
+        keyMonitor = monitor
+        lock.unlock()
+        if let previous {
+            NSEvent.removeMonitor(previous)
+        }
+    }
 
-    func handleSmartTab() {
-        guard isEditable else { return }
-        let selections = selectionManager.textSelections.map(\.range)
-        if selections.count == 1, let range = selections.first, range.length > 0 {
-            indentLines(in: range, unindent: false)
+    func teardown() {
+        if Thread.isMainThread {
+            teardownOnMain()
         } else {
-            replaceCharacters(in: selections, with: "    ")
-        }
-    }
-
-    func handleSmartBacktab() {
-        guard isEditable else { return }
-        guard let range = selectionManager.textSelections.first?.range else { return }
-        indentLines(in: range, unindent: true)
-    }
-
-    func handleSmartNewline() -> Bool {
-        guard isEditable,
-              let sel = selectionManager.textSelections.first?.range else {
-            return false
-        }
-
-        let nsString = textStorage.string as NSString
-        let lineRange = nsString.lineRange(for: NSRange(location: sel.location, length: 0))
-        let linePrefixRange = NSRange(location: lineRange.location, length: max(0, sel.location - lineRange.location))
-        let lineBeforeCursor = nsString.substring(with: linePrefixRange)
-
-        // Extract leading indentation spaces/tabs
-        var indent = ""
-        for ch in lineBeforeCursor {
-            if ch == " " || ch == "\t" {
-                indent.append(ch)
-            } else {
-                break
-            }
-        }
-
-        let trimmedBefore = lineBeforeCursor.trimmingCharacters(in: .whitespaces)
-        let shouldIncreaseIndent = trimmedBefore.hasSuffix("{")
-            || trimmedBefore.hasSuffix("(")
-            || trimmedBefore.hasSuffix("[")
-            || (trimmedBefore.hasSuffix(":") && currentLanguage == .python)
-
-        let nextChar: String? = sel.location < nsString.length
-            ? nsString.substring(with: NSRange(location: sel.location, length: 1))
-            : nil
-        let prevChar: String? = sel.location > 0
-            ? nsString.substring(with: NSRange(location: sel.location - 1, length: 1))
-            : nil
-
-        let isBetweenBrackets = (prevChar == "{" && nextChar == "}")
-            || (prevChar == "[" && nextChar == "]")
-            || (prevChar == "(" && nextChar == ")")
-
-        if isBetweenBrackets {
-            let innerIndent = indent + "    "
-            let insertion = "\n\(innerIndent)\n\(indent)"
-            replaceCharacters(in: sel, with: insertion, skipUpdateSelection: true)
-            let newCursor = sel.location + 1 + innerIndent.count
-            selectionManager.setSelectedRange(NSRange(location: newCursor, length: 0))
-            scrollSelectionToVisible()
-            return true
-        }
-
-        let newIndent = shouldIncreaseIndent ? (indent + "    ") : indent
-        replaceCharacters(in: sel, with: "\n" + newIndent)
-        return true
-    }
-
-    func handleAutoPairEvent(_ event: NSEvent) -> Bool {
-        guard isEditable,
-              !hasMarkedText(),
-              !event.modifierFlags.contains(.command),
-              !event.modifierFlags.contains(.control),
-              let chars = event.characters,
-              chars.count == 1,
-              let ch = chars.first,
-              selectionManager.textSelections.count == 1,
-              let sel = selectionManager.textSelections.first?.range else {
-            return false
-        }
-
-        let nsString = textStorage.string as NSString
-
-        // Overtype existing closing bracket/quote
-        if sel.length == 0,
-           closingPairs.contains(ch),
-           sel.location < nsString.length {
-            let nextStr = nsString.substring(with: NSRange(location: sel.location, length: 1))
-            if nextStr == String(ch) {
-                selectionManager.setSelectedRange(NSRange(location: sel.location + 1, length: 0))
-                return true
-            }
-        }
-
-        // Auto-close brackets and quotes
-        if let closing = autoPairs[ch] {
-            if sel.length > 0 {
-                let selectedText = nsString.substring(with: sel)
-                let wrapped = "\(ch)\(selectedText)\(closing)"
-                replaceCharacters(in: sel, with: wrapped, skipUpdateSelection: true)
-                selectionManager.setSelectedRange(NSRange(location: sel.location + 1, length: sel.length))
-                return true
-            } else {
-                let shouldAutoClose: Bool
-                if ch == "\"" || ch == "'" {
-                    if sel.location > 0 {
-                        let prev = nsString.substring(with: NSRange(location: sel.location - 1, length: 1))
-                        shouldAutoClose = prev.rangeOfCharacter(from: .alphanumerics) == nil
-                    } else {
-                        shouldAutoClose = true
-                    }
-                } else {
-                    shouldAutoClose = true
-                }
-
-                if shouldAutoClose {
-                    replaceCharacters(in: sel, with: "\(ch)\(closing)", skipUpdateSelection: true)
-                    selectionManager.setSelectedRange(NSRange(location: sel.location + 1, length: 0))
-                    return true
-                }
-            }
-        }
-
-        return false
-    }
-
-    override func deleteBackward(_ sender: Any?) {
-        if !hasMarkedText(),
-           selectionManager.textSelections.count == 1,
-           let sel = selectionManager.textSelections.first?.range,
-           sel.length == 0,
-           sel.location > 0,
-           sel.location < textStorage.length {
-            let nsString = textStorage.string as NSString
-            let prev = nsString.substring(with: NSRange(location: sel.location - 1, length: 1))
-            let next = nsString.substring(with: NSRange(location: sel.location, length: 1))
-            if let prevCh = prev.first, let expected = autoPairs[prevCh], String(expected) == next {
-                replaceCharacters(in: NSRange(location: sel.location - 1, length: 2), with: "")
-                return
-            }
-        }
-        super.deleteBackward(sender)
-    }
-
-    func indentLines(in range: NSRange, unindent: Bool) {
-        let nsString = textStorage.string as NSString
-        let fullLinesRange = nsString.lineRange(for: range)
-        let block = nsString.substring(with: fullLinesRange)
-        let lines = block.components(separatedBy: "\n")
-
-        var newLines: [String] = []
-        for (idx, line) in lines.enumerated() {
-            // Preserve trailing empty element produced by trailing newline
-            if idx == lines.count - 1 && line.isEmpty && block.hasSuffix("\n") {
-                newLines.append("")
-                continue
-            }
-            if unindent {
-                if line.hasPrefix("    ") {
-                    newLines.append(String(line.dropFirst(4)))
-                } else if line.hasPrefix("\t") {
-                    newLines.append(String(line.dropFirst(1)))
-                } else {
-                    let leadingSpaces = line.prefix(while: { $0 == " " }).count
-                    newLines.append(String(line.dropFirst(min(leadingSpaces, 4))))
-                }
-            } else {
-                newLines.append("    " + line)
-            }
-        }
-
-        let replacement = newLines.joined(separator: "\n")
-        replaceCharacters(in: fullLinesRange, with: replacement, skipUpdateSelection: true)
-        let updatedRange = NSRange(location: fullLinesRange.location, length: (replacement as NSString).length)
-        selectionManager.setSelectedRange(updatedRange)
-    }
-
-    func toggleComment() {
-        guard isEditable else { return }
-        let prefix = currentLanguage.lineCommentPrefix ?? "//"
-        let nsString = textStorage.string as NSString
-        let sel = selectionManager.textSelections.first?.range ?? NSRange(location: 0, length: 0)
-        let linesRange = nsString.lineRange(for: sel)
-        let block = nsString.substring(with: linesRange)
-        let lines = block.components(separatedBy: "\n")
-
-        let nonEmptyLines = lines.enumerated().filter { idx, line in
-            !(idx == lines.count - 1 && line.isEmpty && block.hasSuffix("\n")) &&
-            !line.trimmingCharacters(in: .whitespaces).isEmpty
-        }
-
-        let allCommented = !nonEmptyLines.isEmpty && nonEmptyLines.allSatisfy { _, line in
-            line.trimmingCharacters(in: .whitespaces).hasPrefix(prefix)
-        }
-
-        var updated: [String] = []
-        for (idx, line) in lines.enumerated() {
-            if idx == lines.count - 1 && line.isEmpty && block.hasSuffix("\n") {
-                updated.append("")
-                continue
-            }
-            if allCommented {
-                if let range = line.range(of: prefix + " ") {
-                    var mutable = line
-                    mutable.removeSubrange(range)
-                    updated.append(mutable)
-                } else if let range = line.range(of: prefix) {
-                    var mutable = line
-                    mutable.removeSubrange(range)
-                    updated.append(mutable)
-                } else {
-                    updated.append(line)
-                }
-            } else {
-                if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    updated.append(line)
-                } else {
-                    let indent = String(line.prefix(while: { $0 == " " || $0 == "\t" }))
-                    let rest = line.dropFirst(indent.count)
-                    updated.append("\(indent)\(prefix) \(rest)")
-                }
-            }
-        }
-
-        let replacement = updated.joined(separator: "\n")
-        replaceCharacters(in: linesRange, with: replacement, skipUpdateSelection: true)
-        let cursorOffset = min(linesRange.location + (replacement as NSString).length, textStorage.length)
-        selectionManager.setSelectedRange(NSRange(location: cursorOffset, length: 0))
-    }
-}
-
-// MARK: - CoreText Line Number Gutter View
-
-final class EditorGutterView: NSView {
-    weak var textView: FlashTextView?
-    weak var scrollView: NSScrollView?
-    var lineSeverities: [Int: LSPDiagnosticSeverity] = [:]
-    var activeLineIndex: Int = 0 {
-        didSet {
-            if oldValue != activeLineIndex {
-                needsDisplay = true
+            DispatchQueue.main.async { [self] in
+                teardownOnMain()
             }
         }
     }
 
-    private var gutterFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
-    private var activeGutterFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+    private func teardownOnMain() {
+        lock.lock()
+        let currentObservers = observers
+        let currentMonitor = keyMonitor
+        observers.removeAll()
+        keyMonitor = nil
+        lock.unlock()
 
-    func updateFontSize(_ editorSize: CGFloat) {
-        let size = max(10, editorSize - 1.5)
-        gutterFont = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)
-        activeGutterFont = NSFont.monospacedDigitSystemFont(ofSize: size, weight: .semibold)
-        needsDisplay = true
-    }
-
-    override var isFlipped: Bool { true }
-
-    override func draw(_ dirtyRect: NSRect) {
-        ZedTheme.gutterBackground.setFill()
-        dirtyRect.fill()
-
-        // Right 1px divider
-        ZedTheme.border.setFill()
-        NSRect(x: bounds.width - 1, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
-
-        guard let textView, let scrollView, let layoutManager = textView.layoutManager else { return }
-        let context = NSGraphicsContext.current?.cgContext
-        context?.saveGState()
-
-        let scrollY = scrollView.documentVisibleRect.origin.y
-        let topInset = scrollView.contentInsets.top
-
-        // Iterate only visible lines from CodeEditTextView's B-Tree LineStorage (O(log N + visible))
-        for linePos in layoutManager.visibleLines() {
-            let yInGutter = linePos.yPos - scrollY + topInset
-            if yInGutter + linePos.height < 0 || yInGutter > bounds.height {
-                continue
-            }
-
-            let isCurrent = (linePos.index == activeLineIndex)
-            if isCurrent {
-                ZedTheme.activeLineBackground.setFill()
-                NSRect(x: 0, y: yInGutter, width: bounds.width - 1, height: linePos.height).fill()
-            }
-
-            if let sev = lineSeverities[linePos.index] {
-                NSColor(hex: sev.colorHex).setFill()
-                let dotRect = NSRect(x: 5, y: yInGutter + (linePos.height - 5) / 2.0, width: 5, height: 5)
-                NSBezierPath(ovalIn: dotRect).fill()
-            }
-
-            let label = "\(linePos.index + 1)"
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: isCurrent ? activeGutterFont : gutterFont,
-                .foregroundColor: isCurrent ? ZedTheme.gutterActiveText : ZedTheme.gutterText
-            ]
-            let attrStr = NSAttributedString(string: label, attributes: attrs)
-            let ctLine = CTLineCreateWithAttributedString(attrStr)
-            var ascent: CGFloat = 0
-            var descent: CGFloat = 0
-            var leading: CGFloat = 0
-            let textWidth = CGFloat(CTLineGetTypographicBounds(ctLine, &ascent, &descent, &leading))
-
-            // Draw using CoreText directly
-            if let context {
-                context.saveGState()
-                // Un-flip locally for CoreText glyph drawing
-                let baselineY = yInGutter + (linePos.height + ascent - descent) / 2.0
-                context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-                context.textPosition = CGPoint(x: bounds.width - 14 - textWidth, y: baselineY)
-                CTLineDraw(ctLine, context)
-                context.restoreGState()
-            }
+        if let currentMonitor {
+            NSEvent.removeMonitor(currentMonitor)
         }
-
-        context?.restoreGState()
+        for obs in currentObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
     }
 }
 
@@ -350,15 +63,17 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
     private var currentTabID: UUID?
     private var currentReloadRevision: Int = 0
+    private var currentLanguage: CodeLanguage = .swift
     private var isProgrammaticUpdate = false
     private var highlightRevision: Int = 0
+    private var needsHighlightAfterIME = false
     private var highlightTask: Task<Void, Never>?
     private var completionTask: Task<Void, Never>?
     private var completionRevision: Int = 0
     private var pendingCompletionInsertedString: String?
-    private var observers: [NSObjectProtocol] = []
+    private var gutterWidthConstraint: NSLayoutConstraint?
+    private let resourceBag = EditorResourceBag()
     private var themeCancellables: Set<AnyCancellable> = []
-    private var keyMonitor: Any?
 
     let completionState = CompletionState()
     private var completionHostingView: NSHostingView<CompletionPopupView>?
@@ -397,12 +112,13 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     deinit {
         highlightTask?.cancel()
         completionTask?.cancel()
-        if let keyMonitor {
-            NSEvent.removeMonitor(keyMonitor)
-        }
-        for obs in observers {
-            NotificationCenter.default.removeObserver(obs)
-        }
+        resourceBag.teardown()
+    }
+
+    func teardown() {
+        highlightTask?.cancel()
+        completionTask?.cancel()
+        resourceBag.teardown()
     }
 
     private func setupUI() {
@@ -433,11 +149,14 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         addSubview(gutterView)
         addSubview(scrollView)
 
+        let widthConstraint = gutterView.widthAnchor.constraint(equalToConstant: 58)
+        self.gutterWidthConstraint = widthConstraint
+
         NSLayoutConstraint.activate([
             gutterView.leadingAnchor.constraint(equalTo: leadingAnchor),
             gutterView.topAnchor.constraint(equalTo: topAnchor),
             gutterView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            gutterView.widthAnchor.constraint(equalToConstant: 58),
+            widthConstraint,
 
             scrollView.leadingAnchor.constraint(equalTo: gutterView.trailingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -467,6 +186,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                self.updateGutterWidthIfNeeded()
+                if self.needsHighlightAfterIME && !self.textView.hasMarkedText() {
+                    self.needsHighlightAfterIME = false
+                    self.scheduleViewportHighlight(debounceMs: 12)
+                }
                 if let inserted = self.pendingCompletionInsertedString {
                     self.pendingCompletionInsertedString = nil
                     self.textView.layoutManager.layoutLines()
@@ -474,7 +198,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 }
             }
         }
-        observers.append(textDidChangeObs)
+        resourceBag.addObserver(textDidChangeObs)
 
         let scrollObs = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -484,6 +208,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.gutterView.needsDisplay = true
+                // Stored in non-@Published tab view state so scrolling causes zero SwiftUI redraws.
                 self.workspace?.updateActiveTabScroll(y: self.scrollView.documentVisibleRect.origin.y)
                 self.scheduleViewportHighlight(debounceMs: 12)
                 if self.workspace?.findState.isFindBarVisible == true {
@@ -495,7 +220,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 }
             }
         }
-        observers.append(scrollObs)
+        resourceBag.addObserver(scrollObs)
 
         let selObs = NotificationCenter.default.addObserver(
             forName: TextSelectionManager.selectionChangedNotification,
@@ -503,12 +228,17 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.updateCursorStatus()
+                guard let self else { return }
+                self.updateCursorStatus()
+                if self.needsHighlightAfterIME && !self.textView.hasMarkedText() {
+                    self.needsHighlightAfterIME = false
+                    self.scheduleViewportHighlight(debounceMs: 12)
+                }
             }
         }
-        observers.append(selObs)
+        resourceBag.addObserver(selObs)
 
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
             guard let self,
                   self.workspace?.activeOverlay == OverlayPanelMode.none,
                   let window = self.window,
@@ -604,6 +334,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             }
             return event
         }
+        resourceBag.setKeyMonitor(monitor)
 
         let tm = ThemeManager.shared
         tm.$currentThemeID.dropFirst()
@@ -625,6 +356,14 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.applyThemeAndFont() }
             .store(in: &themeCancellables)
+    }
+
+    private func updateGutterWidthIfNeeded() {
+        let lineCount = max(1, textView.layoutManager.lineCount)
+        let targetWidth = gutterView.requiredWidth(forLineCount: lineCount)
+        if let constraint = gutterWidthConstraint, abs(constraint.constant - targetWidth) >= 2 {
+            constraint.constant = targetWidth
+        }
     }
 
     func applyThemeAndFont() {
@@ -662,6 +401,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         textView.needsDisplay = true
 
         gutterView.updateFontSize(ThemeManager.shared.editorFontSize)
+        updateGutterWidthIfNeeded()
         gutterView.needsDisplay = true
         scheduleViewportHighlight(debounceMs: 0)
     }
@@ -673,10 +413,18 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             return
         }
 
+        let isReadOnly = (tab.virtualKey != nil)
+        if textView.isEditable == isReadOnly {
+            textView.isEditable = !isReadOnly
+        }
+
         let tabChanged = (currentTabID != tab.id) || (currentReloadRevision != tab.externalReloadRevision)
+        let languageChanged = (currentLanguage != tab.language)
+
         if tabChanged {
             currentTabID = tab.id
             currentReloadRevision = tab.externalReloadRevision
+            currentLanguage = tab.language
             isProgrammaticUpdate = true
             textView.currentLanguage = tab.language
             textView.typingAttributes = [
@@ -686,17 +434,15 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             textView.setText(tab.content)
             textView.updateFrameIfNeeded()
 
-            // Restore selection or jump to requested line
             if let jumpLine = tab.pendingJumpLine {
-                jumpToLine(jumpLine)
-                if let idx = workspace?.openTabs.firstIndex(where: { $0.id == tab.id }) {
-                    workspace?.openTabs[idx].pendingJumpLine = nil
-                }
+                jumpToLine(jumpLine, column: tab.pendingJumpColumn)
+                workspace?.clearPendingJump(for: tab.id)
             } else {
-                let safeLoc = min(tab.selectedRange.location, textView.textStorage.length)
-                let safeLen = min(tab.selectedRange.length, max(0, textView.textStorage.length - safeLoc))
+                let savedRange = workspace?.selectedRange(for: tab.id) ?? NSRange(location: 0, length: 0)
+                let safeLoc = min(savedRange.location, textView.textStorage.length)
+                let safeLen = min(savedRange.length, max(0, textView.textStorage.length - safeLoc))
                 textView.selectionManager.setSelectedRange(NSRange(location: safeLoc, length: safeLen))
-                let targetY = tab.scrollOffsetY ?? -scrollView.contentInsets.top
+                let targetY = workspace?.scrollOffsetY(for: tab.id) ?? -scrollView.contentInsets.top
                 scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
                 scrollView.reflectScrolledClipView(scrollView.contentView)
             }
@@ -705,16 +451,22 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             dismissCompletion()
             refreshDiagnosticsOverlay()
             applyOverlayAttributes()
+            updateGutterWidthIfNeeded()
             gutterView.needsDisplay = true
             updateCursorStatus()
             scheduleViewportHighlight(debounceMs: 0)
             focusEditor()
-        } else if let pendingLine = tab.pendingJumpLine {
-            jumpToLine(pendingLine)
-            if let idx = workspace?.openTabs.firstIndex(where: { $0.id == tab.id }) {
-                workspace?.openTabs[idx].pendingJumpLine = nil
+        } else {
+            if languageChanged {
+                currentLanguage = tab.language
+                textView.currentLanguage = tab.language
+                scheduleViewportHighlight(debounceMs: 0)
             }
-            focusEditor()
+            if let pendingLine = tab.pendingJumpLine {
+                jumpToLine(pendingLine, column: tab.pendingJumpColumn)
+                workspace?.clearPendingJump(for: tab.id)
+                focusEditor()
+            }
         }
     }
 
@@ -722,10 +474,13 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         window?.makeFirstResponder(textView)
     }
 
-    func jumpToLine(_ lineNumber: Int) {
+    func jumpToLine(_ lineNumber: Int, column: Int? = nil) {
         let zeroBased = max(0, lineNumber - 1)
         if let linePos = textView.layoutManager.textLineForIndex(zeroBased) {
-            let targetRange = NSRange(location: linePos.range.location, length: 0)
+            let lineEnd = linePos.range.location + linePos.range.length
+            let colOffset = max(0, (column ?? 1) - 1)
+            let clampedOffset = min(linePos.range.location + colOffset, max(linePos.range.location, lineEnd))
+            let targetRange = NSRange(location: min(clampedOffset, textView.textStorage.length), length: 0)
             textView.selectionManager.setSelectedRange(targetRange)
             textView.scrollToRange(targetRange, center: true)
             gutterView.activeLineIndex = zeroBased
@@ -744,12 +499,12 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     }
 
     func replaceRange(_ range: NSRange, with replacement: String) {
-        guard let storage = textView.textStorage, range.max <= storage.length else { return }
+        guard textView.isEditable, let storage = textView.textStorage, range.max <= storage.length else { return }
         textView.replaceCharacters(in: range, with: replacement)
     }
 
     func replaceEntireDocument(with newText: String) {
-        guard let storage = textView.textStorage else { return }
+        guard textView.isEditable, let storage = textView.textStorage else { return }
         textView.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: newText)
     }
 
@@ -787,21 +542,6 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         highlightTask?.cancel()
         highlightRevision &+= 1
         let revision = highlightRevision
-        let language = textView.currentLanguage
-        let totalLength = textView.textStorage.length
-        guard totalLength > 0 else { return }
-
-        // Compute visible range + generous buffer so scrolling stays seamless
-        let visibleRange = textView.visibleTextRange ?? NSRange(location: 0, length: min(totalLength, 6000))
-        let buffer = 3500
-        let start = max(0, visibleRange.location - buffer)
-        let end = min(totalLength, visibleRange.max + buffer)
-        let targetRange = NSRange(location: start, length: max(0, end - start))
-        guard targetRange.length > 0 else { return }
-
-        let nsString = textView.textStorage.string as NSString
-        let slice = nsString.substring(with: targetRange)
-        let palette = ZedTheme.palette
 
         highlightTask = Task { [weak self] in
             if debounceMs > 0 {
@@ -809,37 +549,60 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             }
             if Task.isCancelled { return }
 
+            // Slice textStorage AFTER debounce sleep so superseded keystrokes allocate zero strings.
+            let snapshot: (slice: String, start: Int, targetRange: NSRange, language: CodeLanguage, palette: ThemePalette)? = await MainActor.run { [weak self] in
+                guard let self, self.highlightRevision == revision else { return nil }
+                let totalLength = self.textView.textStorage.length
+                guard totalLength > 0 else { return nil }
+                let visibleRange = self.textView.visibleTextRange ?? NSRange(location: 0, length: min(totalLength, 6000))
+                let buffer = 3500
+                let start = max(0, visibleRange.location - buffer)
+                let end = min(totalLength, visibleRange.max + buffer)
+                let targetRange = NSRange(location: start, length: max(0, end - start))
+                guard targetRange.length > 0 else { return nil }
+                let nsString = self.textView.textStorage.string as NSString
+                let slice = nsString.substring(with: targetRange)
+                return (slice, start, targetRange, self.textView.currentLanguage, ZedTheme.palette)
+            }
+            guard let snapshot, !Task.isCancelled else { return }
+
             let clockStart = DispatchTime.now().uptimeNanoseconds
             let tokens = await Task.detached(priority: .userInitiated) {
                 SyntaxHighlighter.shared.tokenize(
-                    slice: slice,
-                    baseOffset: start,
-                    language: language,
-                    palette: palette
+                    slice: snapshot.slice,
+                    baseOffset: snapshot.start,
+                    language: snapshot.language,
+                    palette: snapshot.palette
                 )
             }.value
             let tokenizeMs = Double(DispatchTime.now().uptimeNanoseconds - clockStart) / 1_000_000.0
 
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 guard let self, self.highlightRevision == revision else { return }
-                guard !self.textView.hasMarkedText() else { return }
-                let storage = self.textView.textStorage!
+                if self.textView.hasMarkedText() {
+                    self.needsHighlightAfterIME = true
+                    return
+                }
+                guard let storage = self.textView.textStorage else { return }
                 let safeLength = storage.length
-                let applyStart = min(targetRange.location, safeLength)
-                let applyLength = min(targetRange.length, max(0, safeLength - applyStart))
+                let applyStart = min(snapshot.targetRange.location, safeLength)
+                let applyLength = min(snapshot.targetRange.length, max(0, safeLength - applyStart))
                 guard applyLength > 0 else { return }
 
+                let resolved = ThemeManager.shared.resolvedColors
+                let plainColor = resolved.tokenColorLookup[snapshot.palette.plainTextHex] ?? resolved.plainText
                 let applyRange = NSRange(location: applyStart, length: applyLength)
                 storage.beginEditing()
-                storage.addAttribute(.foregroundColor, value: NSColor(hex: palette.plainTextHex), range: applyRange)
+                storage.addAttribute(.foregroundColor, value: plainColor, range: applyRange)
                 for token in tokens {
                     if token.range.location >= applyStart && token.range.max <= applyStart + applyLength {
-                        storage.addAttribute(.foregroundColor, value: NSColor(hex: token.colorHex), range: token.range)
+                        let color = resolved.tokenColorLookup[token.colorHex] ?? NSColor(hex: token.colorHex)
+                        storage.addAttribute(.foregroundColor, value: color, range: token.range)
                     }
                 }
                 storage.endEditing()
 
-                self.workspace?.lastRenderLatencyMs = tokenizeMs
+                self.workspace?.updateRenderLatency(tokenizeMs)
             }
         }
     }
@@ -949,12 +712,17 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         return NSRange(location: safeStart, length: safeEnd - safeStart)
     }
 
+    /// O(log N) UTF-16 LSP position lookup backed by CodeEditTextView's B-Tree LineStorage.
     private func lspPosition(for offset: Int) -> LSPPosition? {
         guard let storage = textView.textStorage else { return nil }
-        return Self.computeLSPPosition(in: storage.string as NSString, at: offset)
+        let clamped = max(0, min(offset, storage.length))
+        if let linePos = textView.layoutManager.textLineForOffset(clamped) {
+            return LSPPosition(line: linePos.index, character: max(0, clamped - linePos.range.location))
+        }
+        return Self.computeLSPPosition(in: storage.string as NSString, at: clamped)
     }
 
-    static func computeLSPPosition(in nsString: NSString, at offset: Int) -> LSPPosition {
+    nonisolated static func computeLSPPosition(in nsString: NSString, at offset: Int) -> LSPPosition {
         let clamped = max(0, min(offset, nsString.length))
         var line = 0
         var lineStart = 0
@@ -1016,7 +784,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         completionRevision &+= 1
         let rev = completionRevision
 
-        guard let storage = textView.textStorage else { return }
+        guard textView.isEditable, let storage = textView.textStorage else { return }
         let nsText = storage.string as NSString
         let cursor = min(textView.selectionManager.textSelections.first?.range.location ?? 0, nsText.length)
         let prefixRange = LocalCompletionProvider.identifierPrefixRange(in: nsText, at: cursor)
@@ -1039,7 +807,6 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         let language = textView.currentLanguage
         let content = storage.string
 
-        // Show local suggestions immediately for instant responsiveness
         let localItems = LocalCompletionProvider.mergeAndRank(
             prefix: prefix,
             language: language,
@@ -1053,12 +820,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             dismissCompletion()
         }
 
-        // Also query active LSP in background if document has a file URL
         guard let workspace,
-              let fileURL = workspace.activeTab?.url else {
+              let fileURL = workspace.activeTab?.url,
+              let pos = lspPosition(for: cursor) else {
             return
         }
-        let pos = Self.computeLSPPosition(in: nsText, at: cursor)
         let root = workspace.rootURL
         completionTask = Task { [weak self] in
             let lspItems = await LSPManager.shared.requestCompletions(
@@ -1116,7 +882,6 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         let popupHeight = min(230, CGFloat(max(1, items.count)) * 27 + 10)
         let x = max(8, min(bottomPoint.x, max(8, bounds.width - popupWidth - 8)))
 
-        // Container uses standard macOS bottom-left coordinates (isFlipped == false)
         var y = bottomPoint.y - popupHeight - 4
         if y < 8 {
             y = topPoint.y + 4
@@ -1139,7 +904,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     private func acceptCompletion(_ item: LSPCompletionItem) {
         let range = completionState.prefixRange
         dismissCompletion()
-        guard let storage = textView.textStorage, range.max <= storage.length else { return }
+        guard textView.isEditable, let storage = textView.textStorage, range.max <= storage.length else { return }
         isProgrammaticUpdate = true
         textView.replaceCharacters(in: range, with: item.insertText)
         let newLoc = min(storage.length, range.location + (item.insertText as NSString).length)
@@ -1177,7 +942,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                     workspace.statusMessage = L10n("lsp.definition.notFound")
                     return
                 }
-                workspace.openFile(url: targetURL.standardized, atLine: first.range.start.line + 1)
+                workspace.openFile(
+                    url: targetURL.standardized,
+                    atLine: first.range.start.line + 1,
+                    atColumn: first.range.start.character + 1
+                )
             }
         }
     }
@@ -1197,16 +966,19 @@ struct HighPerformanceEditorRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: HighPerformanceEditorContainerView, context: Context) {
-        bindCallbacks(to: nsView)
         nsView.syncWithTab(activeTab)
+    }
+
+    static func dismantleNSView(_ nsView: HighPerformanceEditorContainerView, coordinator: ()) {
+        nsView.teardown()
     }
 
     private func bindCallbacks(to view: HighPerformanceEditorContainerView) {
         workspace.onToggleCommentRequested = { [weak view] in
             view?.textView.toggleComment()
         }
-        workspace.onJumpToLineRequested = { [weak view] line in
-            view?.jumpToLine(line)
+        workspace.onJumpToLocationRequested = { [weak view] line, column in
+            view?.jumpToLine(line, column: column)
         }
         workspace.onFocusEditorRequested = { [weak view] in
             view?.focusEditor()

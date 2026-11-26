@@ -12,7 +12,12 @@ func L10n(_ key: String) -> String {
 @MainActor
 func L10n(_ key: String, _ args: CVarArg...) -> String {
     let format = LocalizationManager.shared.tr(key)
-    return String(format: format, arguments: args)
+    let fallbackFormat = LocalizationManager.defaultEnglishStrings[key] ?? key
+    // Defense-in-depth: never pass a format string with mismatched C format specifiers into String(format:).
+    let safeFormat = LocalizationManager.hasMatchingFormatSpecifiers(format, reference: fallbackFormat)
+        ? format
+        : fallbackFormat
+    return String(format: safeFormat, arguments: args)
 }
 
 // MARK: - LocalizationManager
@@ -26,6 +31,10 @@ final class LocalizationManager: ObservableObject {
     private enum Keys {
         static let activeLanguagePluginID = "swiftflash.activeLanguagePluginID"
     }
+
+    private nonisolated static let formatSpecifierRegex = try! NSRegularExpression(
+        pattern: #"%(?:%|(?:\d+\$)?[-+# 0]*(?:\d+)?(?:\.\d+)?(?:ll|l|h|hh|z|t|j)?[@dDuUxXoOfeEgGcCsSpaAF])"#
+    )
 
     /// The language plugin ID saved for the next launch (persisted immediately).
     @Published var selectedLanguagePluginID: String {
@@ -68,6 +77,7 @@ final class LocalizationManager: ObservableObject {
     /// Loads the configured language plugin from disk. Called at startup (or in tests).
     func loadLanguagePackOnStartup(pluginID: String) {
         guard !pluginID.isEmpty,
+              PluginManager.isValidPluginID(pluginID),
               let result = Self.readLanguagePluginStrings(pluginID: pluginID) else {
             activeStrings = [:]
             loadedLanguagePluginID = ""
@@ -79,9 +89,34 @@ final class LocalizationManager: ObservableObject {
             return
         }
 
-        activeStrings = result.strings
+        // Filter out any entries whose format specifiers don't match the canonical English string.
+        var validated: [String: String] = [:]
+        validated.reserveCapacity(result.strings.count)
+        for (key, value) in result.strings {
+            if let reference = Self.defaultEnglishStrings[key],
+               !Self.hasMatchingFormatSpecifiers(value, reference: reference) {
+                continue
+            }
+            validated[key] = value
+        }
+
+        activeStrings = validated
         loadedLanguagePluginID = pluginID
         loadedLanguageDisplayName = result.nativeName
+    }
+
+    nonisolated static func extractFormatSpecifiers(from text: String) -> [String] {
+        let ns = text as NSString
+        let matches = formatSpecifierRegex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        return matches.compactMap { match in
+            let token = ns.substring(with: match.range)
+            if token == "%%" { return nil }
+            return token.last.map { String($0) }
+        }
+    }
+
+    nonisolated static func hasMatchingFormatSpecifiers(_ candidate: String, reference: String) -> Bool {
+        extractFormatSpecifiers(from: candidate) == extractFormatSpecifiers(from: reference)
     }
 
     func restartApplication() {
@@ -108,17 +143,16 @@ final class LocalizationManager: ObservableObject {
     }
 
     private static func readLanguagePluginStrings(pluginID: String) -> (nativeName: String, strings: [String: String])? {
-        let pluginDir = PluginStorage.pluginsDirectory.appendingPathComponent(pluginID, isDirectory: true)
+        guard let pluginDir = PluginStorage.validatedPluginDirectory(id: pluginID) else {
+            return nil
+        }
         let manifestURL = pluginDir.appendingPathComponent("manifest.json")
         guard let manifestData = try? Data(contentsOf: manifestURL),
               let manifest = try? JSONDecoder().decode(PluginManifest.self, from: manifestData),
               manifest.type == .language,
-              let loc = manifest.contributes?.localization else {
-            return nil
-        }
-
-        let stringsURL = pluginDir.appendingPathComponent(loc.stringsFile)
-        guard let stringsData = try? Data(contentsOf: stringsURL),
+              let loc = manifest.contributes?.localization,
+              let stringsURL = PluginStorage.validatedRelativeFile(loc.stringsFile, inside: pluginDir),
+              let stringsData = try? Data(contentsOf: stringsURL),
               let decoded = try? JSONDecoder().decode([String: String].self, from: stringsData) else {
             return nil
         }
@@ -137,12 +171,6 @@ final class LocalizationManager: ObservableObject {
         "common.save": "Save",
         "common.unsavedBuffer": "Unsaved Buffer",
         "common.close": "Close",
-        "common.install": "Install",
-        "common.uninstall": "Uninstall",
-        "common.installed": "Installed",
-        "common.active": "Active",
-        "common.use": "Use",
-        "common.refresh": "Refresh",
 
         "menu.app.about": "About SwiftFlash",
         "menu.app.settings": "Theme, Font & Language Settings...",
@@ -173,13 +201,6 @@ final class LocalizationManager: ObservableObject {
         "menu.view.toggleGitPanel": "Toggle Git Panel",
         "menu.view.viewGitDiff": "View Git Diff",
         "menu.view.toggleTerminal": "Toggle Integrated Terminal",
-
-        "theme.subtitle.zedOneDark": "Classic dark",
-        "theme.subtitle.zedGruvboxLight": "Warm retro light",
-        "theme.subtitle.zedOneLight": "Crisp daylight",
-        "theme.subtitle.tokyoNight": "Deep indigo night",
-        "theme.subtitle.catppuccinMocha": "Soothing pastel dark",
-        "theme.subtitle.githubDarkDimmed": "Soft slate dark",
 
         "header.project.help": "Switch Project / Directory (⌘⇧O)",
         "header.worktree.local": "local",
@@ -271,6 +292,9 @@ final class LocalizationManager: ObservableObject {
         "status.copiedPathFormat": "Copied path: %@",
         "status.itemExistsFormat": "Already exists: %@",
         "status.fileOpFailedFormat": "Operation failed: %@",
+        "status.invalidPath": "Invalid file or folder name",
+        "status.fileTooLargeFormat": "File too large to open in editor (%@): %@",
+        "status.gitTimedOutFormat": "Git %@ timed out",
 
         "git.notARepo.title": "Not a Git repository",
         "git.notARepo.detail": "Current directory is not a Git repository",
@@ -302,7 +326,7 @@ final class LocalizationManager: ObservableObject {
         "git.remote.fetchPrune": "Fetch (--prune)",
         "git.remote.pull": "Pull",
         "git.remote.push": "Push",
-        "git.commit.placeholder": "Enter commit message",
+        "git.commit.placeholder": "Enter commit message (⌘↵ to commit)",
         "git.commit.collapseHelp": "Collapse Commit Editor",
         "git.commit.expandHelp": "Expand Commit Editor",
         "git.commit.optionsHelp": "Commit Options",
@@ -321,7 +345,7 @@ final class LocalizationManager: ObservableObject {
         "git.file.discardEllipsis": "Discard Changes...",
 
         "statusbar.dock.explorerHelp": "Project Panel (⌘B)",
-        "statusbar.dock.gitHelp": "Git Panel (⌘⇧G)",
+        "statusbar.dock.gitHelp": "Git Panel (⌃⇧G)",
         "statusbar.dock.searchHelp": "Search Panel (⌘⇧F)",
         "statusbar.terminal": "Terminal",
         "statusbar.terminal.help": "Toggle Integrated Terminal (⌘J)",
@@ -347,7 +371,6 @@ final class LocalizationManager: ObservableObject {
         "editor.welcome.toggleTerminal": "Toggle Terminal",
         "editor.welcome.toggleSidebar": "Toggle Sidebar",
 
-        "terminal.title": "TERMINAL",
         "terminal.stop": "Stop",
         "terminal.clearHelp": "Clear Terminal",
         "terminal.hideHelp": "Hide Terminal (⌘J)",
@@ -410,6 +433,10 @@ final class LocalizationManager: ObservableObject {
 
         "alert.saveChanges.titleFormat": "Save changes to \"%@\"?",
         "alert.saveChanges.message": "Your changes will be lost if you don't save them.",
+        "alert.unsavedQuit.titleFormat": "You have %d unsaved file(s). Save changes before quitting?",
+        "alert.unsavedQuit.message": "Unsaved changes will be lost if you quit without saving.",
+        "alert.unsavedQuit.saveAll": "Save All & Quit",
+        "alert.unsavedQuit.quitWithoutSaving": "Quit Without Saving",
         "alert.discardFile.titleFormat": "Discard changes to \"%@\"?",
         "alert.discardFile.untrackedMsg": "This untracked file will be permanently deleted from disk.",
         "alert.discardFile.modifiedMsg": "Your uncommitted modifications to this file will be reverted.",
@@ -526,6 +553,17 @@ final class LocalizationManager: ObservableObject {
         "status.copiedPathFormat": "已复制路径：%@",
         "status.itemExistsFormat": "已存在同名项目：%@",
         "status.fileOpFailedFormat": "操作失败：%@",
+        "status.invalidPath": "无效的文件或文件夹名称",
+        "status.fileTooLargeFormat": "文件过大无法在编辑器中打开（%@）：%@",
+        "status.gitTimedOutFormat": "Git %@ 执行超时",
+
+        "alert.unsavedQuit.titleFormat": "有 %d 个未保存的文件，退出前是否保存更改？",
+        "alert.unsavedQuit.message": "如果不保存直接退出，未保存的修改将会丢失。",
+        "alert.unsavedQuit.saveAll": "全部保存并退出",
+        "alert.unsavedQuit.quitWithoutSaving": "不保存并退出",
+
+        "statusbar.dock.gitHelp": "Git 面板 (⌃⇧G)",
+        "git.commit.placeholder": "输入提交说明 (⌘↵ 提交)",
 
         "menu.edit.find": "查找...",
         "menu.edit.findReplace": "查找并替换...",

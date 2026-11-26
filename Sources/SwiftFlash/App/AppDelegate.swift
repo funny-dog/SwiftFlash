@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titleCancellable: AnyCancellable?
     private var themeCancellable: AnyCancellable?
     private var systemAppearanceObserver: NSObjectProtocol?
+    private var pendingOpenURLs: [URL] = []
+    private var hasFinishedLaunching = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = LocalizationManager.shared
@@ -27,7 +29,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let initialFolder = parseFolderArgument()
+        let launchURLs = Self.parseLaunchArguments(Array(CommandLine.arguments.dropFirst())) + pendingOpenURLs
+        pendingOpenURLs.removeAll()
+
+        var initialFolder: URL?
+        var remainingURLs: [URL] = []
+        var extraDirectories: [URL] = []
+        for url in launchURLs {
+            if let target = WorkspaceState.parseExternalURL(url) {
+                var isDir: ObjCBool = false
+                let stdURL = target.url.standardized
+                if FileManager.default.fileExists(atPath: stdURL.path, isDirectory: &isDir), isDir.boolValue {
+                    if initialFolder == nil {
+                        initialFolder = stdURL
+                        continue
+                    } else if stdURL.path == initialFolder?.path {
+                        continue
+                    } else {
+                        extraDirectories.append(stdURL)
+                        continue
+                    }
+                }
+            }
+            remainingURLs.append(url)
+        }
+
         workspace = WorkspaceState(initialURL: initialFolder)
         rootController = RootIDEViewController(workspace: workspace)
 
@@ -67,6 +93,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        hasFinishedLaunching = true
+
+        // Register extra directories into window switcher without re-reloading `initialFolder`.
+        for extraDir in extraDirectories {
+            if !workspace.windowProjects.contains(where: { $0.standardized.path == extraDir.path }) {
+                workspace.windowProjects.append(extraDir)
+            }
+            workspace.recordRecentProject(extraDir)
+        }
+        if !remainingURLs.isEmpty {
+            workspace.openExternalURLs(remainingURLs)
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard hasFinishedLaunching, workspace != nil else {
+            pendingOpenURLs.append(contentsOf: urls)
+            return
+        }
+        workspace.openExternalURLs(urls)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func applyAppThemeAppearance() {
@@ -81,12 +129,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let isSystemDark = (style == "Dark")
         let resourceName = isSystemDark ? "AppIcon-Dark" : "AppIcon-Light"
 
-        if let url = Bundle.main.url(forResource: resourceName, withExtension: "png"),
+        if let url = Bundle.module.url(forResource: resourceName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = image
             return
         }
-        if let url = Bundle.module.url(forResource: resourceName, withExtension: "png"),
+        if let url = Bundle.main.url(forResource: resourceName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = image
         }
@@ -96,26 +144,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let workspace else { return .terminateNow }
+        return workspace.confirmTerminationWithUnsavedChanges() ? .terminateNow : .terminateCancel
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        if let systemAppearanceObserver {
+            DistributedNotificationCenter.default().removeObserver(systemAppearanceObserver)
+            self.systemAppearanceObserver = nil
+        }
+        rootController?.mainSplitController.shutdownTerminal()
         workspace?.stopRunningTask()
         LSPManager.shared.shutdownAll()
     }
 
-    private func parseFolderArgument() -> URL? {
-        let args = CommandLine.arguments.dropFirst()
-        if let firstPath = args.first {
-            let url = URL(fileURLWithPath: firstPath).standardized
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                return url
+    nonisolated static func parseLaunchArguments(_ arguments: [String]) -> [URL] {
+        var urls: [URL] = []
+        let fm = FileManager.default
+        for arg in arguments {
+            guard !arg.isEmpty else { continue }
+            let lower = arg.lowercased()
+            if lower.hasPrefix("swiftflash://") || lower.hasPrefix("file://") {
+                if let url = URL(string: arg) {
+                    urls.append(url)
+                } else if let encoded = arg.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed),
+                          let url = URL(string: encoded) {
+                    urls.append(url)
+                }
+                continue
+            }
+            let fileURL = URL(fileURLWithPath: arg).standardized
+            let exists = fm.fileExists(atPath: fileURL.path)
+            if arg.hasPrefix("-") && !exists {
+                continue
+            }
+            if exists {
+                urls.append(fileURL)
             }
         }
-        return nil
+        return urls
     }
 
     private func updateWindowTitle() {
         guard workspace.hasWorkspaceOpen else {
-            window.title = "SwiftFlash"
+            if let tab = workspace.activeTab {
+                let dirtyMark = tab.isDirty ? " •" : ""
+                window.title = "\(tab.title)\(dirtyMark) — SwiftFlash"
+            } else {
+                window.title = "SwiftFlash"
+            }
             return
         }
         let folderName = workspace.rootURL.lastPathComponent
@@ -179,6 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func globalSearchAction(_ sender: Any?) {
         rootController.mainSplitController.ensureSidebarVisible(mode: .search)
+        workspace.searchFocusNonce &+= 1
     }
 
     @objc private func toggleGitPanelAction(_ sender: Any?) {
@@ -316,7 +395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(makeItem(L10n("menu.view.resetZoom"), action: #selector(resetZoomAction(_:)), key: "0"))
         viewMenu.addItem(NSMenuItem.separator())
         viewMenu.addItem(makeItem(L10n("menu.view.toggleSidebar"), action: #selector(toggleSidebarAction(_:)), key: "b"))
-        viewMenu.addItem(makeItem(L10n("menu.view.toggleGitPanel"), action: #selector(toggleGitPanelAction(_:)), key: "G"))
+        let toggleGitItem = NSMenuItem(title: L10n("menu.view.toggleGitPanel"), action: #selector(toggleGitPanelAction(_:)), keyEquivalent: "g")
+        toggleGitItem.keyEquivalentModifierMask = [.control, .shift]
+        viewMenu.addItem(toggleGitItem)
         let viewDiffItem = NSMenuItem(title: L10n("menu.view.viewGitDiff"), action: #selector(viewGitDiffAction(_:)), keyEquivalent: "d")
         viewDiffItem.keyEquivalentModifierMask = [.control, .command]
         viewMenu.addItem(viewDiffItem)

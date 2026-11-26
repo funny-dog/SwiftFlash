@@ -85,8 +85,8 @@ else
   echo "Cask 内容未发生改变，跳过提交"
 fi
 
-USER_TAP_DIR="$HOME/codes/practice/homebrew-tap"
-if [ -d "$USER_TAP_DIR" ] && [ "$USER_TAP_DIR" != "$TAP_DIR" ]; then
+USER_TAP_DIR="${SWIFTFLASH_LOCAL_TAP_DIR:-}"
+if [ -n "$USER_TAP_DIR" ] && [ -d "$USER_TAP_DIR" ] && [ "$USER_TAP_DIR" != "$TAP_DIR" ]; then
   git -C "$USER_TAP_DIR" pull --ff-only origin main 2>/dev/null || true
   echo "本地 checkout $USER_TAP_DIR 已同步"
 fi

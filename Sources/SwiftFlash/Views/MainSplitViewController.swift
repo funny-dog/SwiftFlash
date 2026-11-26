@@ -63,6 +63,15 @@ final class EditorTerminalSplitController: NSSplitViewController {
         addSplitViewItem(terminalSplitItem)
     }
 
+    override func splitViewDidResizeSubviews(_ notification: Notification) {
+        super.splitViewDidResizeSubviews(notification)
+        guard let terminalSplitItem else { return }
+        let visible = !terminalSplitItem.isCollapsed
+        if workspace.isTerminalVisible != visible {
+            workspace.isTerminalVisible = visible
+        }
+    }
+
     func toggleTerminal() {
         let shouldCollapse = !terminalSplitItem.isCollapsed
         terminalSplitItem.animator().isCollapsed = shouldCollapse
@@ -79,6 +88,10 @@ final class EditorTerminalSplitController: NSSplitViewController {
             workspace.isTerminalVisible = true
         }
     }
+
+    func shutdownTerminal() {
+        terminalSession.terminateRunningCommand(appendNotice: false)
+    }
 }
 
 // MARK: - Horizontal Split (Sidebar Left + Editor/Terminal Right)
@@ -88,6 +101,7 @@ final class MainSplitViewController: NSSplitViewController {
     let workspace: WorkspaceState
     private var sidebarItem: NSSplitViewItem!
     private var rightSplitController: EditorTerminalSplitController!
+    private var hasAppliedInitialLayout = false
 
     init(workspace: WorkspaceState) {
         self.workspace = workspace
@@ -136,6 +150,8 @@ final class MainSplitViewController: NSSplitViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
+        guard !hasAppliedInitialLayout else { return }
+        hasAppliedInitialLayout = true
         if splitView.arrangedSubviews.count > 1 {
             splitView.setPosition(310, ofDividerAt: 0)
         }
@@ -144,6 +160,15 @@ final class MainSplitViewController: NSSplitViewController {
             if totalH > 360 {
                 rightSplitController.splitView.setPosition(totalH - 210, ofDividerAt: 0)
             }
+        }
+    }
+
+    override func splitViewDidResizeSubviews(_ notification: Notification) {
+        super.splitViewDidResizeSubviews(notification)
+        guard let sidebarItem else { return }
+        let visible = !sidebarItem.isCollapsed
+        if workspace.isSidebarVisible != visible {
+            workspace.isSidebarVisible = visible
         }
     }
 
@@ -182,6 +207,10 @@ final class MainSplitViewController: NSSplitViewController {
 
     func toggleTerminal() {
         rightSplitController.toggleTerminal()
+    }
+
+    func shutdownTerminal() {
+        rightSplitController?.shutdownTerminal()
     }
 }
 
@@ -263,8 +292,10 @@ final class RootIDEViewController: NSViewController {
             overlayContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
-        themeCancellable = ThemeManager.shared.$currentThemeID.sink { [weak self] _ in
-            self?.view.layer?.backgroundColor = ZedTheme.background.cgColor
+        // Use the emitted `newThemeID` directly because `@Published` fires on willSet.
+        themeCancellable = ThemeManager.shared.$currentThemeID.sink { [weak self] newThemeID in
+            let bg = NSColor(hex: ThemePalette.palette(for: newThemeID).backgroundHex)
+            self?.view.layer?.backgroundColor = bg.cgColor
         }
     }
 }

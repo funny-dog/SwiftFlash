@@ -488,4 +488,151 @@ final class SwiftFlashTests: XCTestCase {
         XCTAssertEqual(container.completionState.items.map(\.label), ["collections"])
         XCTAssertFalse(container.completionState.items.contains { $0.label == "finally" || $0.label == "for" })
     }
+
+    func testInfoPlistDeclaresEditorMetadata() throws {
+        let plistURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/Info.plist")
+
+        let data = try Data(contentsOf: plistURL)
+        let rawPlist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        let plist = try XCTUnwrap(rawPlist as? [String: Any])
+
+        XCTAssertEqual(plist["LSApplicationCategoryType"] as? String, "public.app-category.developer-tools")
+
+        let docTypes = try XCTUnwrap(plist["CFBundleDocumentTypes"] as? [[String: Any]])
+        XCTAssertFalse(docTypes.isEmpty)
+
+        var editorUTIs = Set<String>()
+        for docType in docTypes {
+            XCTAssertEqual(docType["CFBundleTypeRole"] as? String, "Editor")
+            XCTAssertEqual(docType["LSHandlerRank"] as? String, "Alternate")
+            if let utis = docType["LSItemContentTypes"] as? [String] {
+                editorUTIs.formUnion(utis)
+            }
+        }
+
+        for expectedUTI in ["public.source-code", "public.plain-text", "public.data", "public.folder"] {
+            XCTAssertTrue(editorUTIs.contains(expectedUTI), "Missing Editor UTI: \(expectedUTI)")
+        }
+
+        let urlTypes = try XCTUnwrap(plist["CFBundleURLTypes"] as? [[String: Any]])
+        let schemes = urlTypes.flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] }
+        XCTAssertTrue(schemes.contains("swiftflash"))
+    }
+
+    func testParseExternalURLSupportsFileAndCustomScheme() throws {
+        let tempDir = try makeTempDirectory(name: "parse-ext-\(UUID().uuidString)")
+        let spacedDir = tempDir.appendingPathComponent("with spaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: spacedDir, withIntermediateDirectories: true)
+        let fileURL = spacedDir.appendingPathComponent("demo.swift")
+        try "let x = 1\n".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let parsedFile = WorkspaceState.parseExternalURL(fileURL)
+        XCTAssertEqual(parsedFile, ExternalOpenTarget(url: fileURL.standardized, line: nil))
+
+        let encodedPath = fileURL.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileURL.path
+        let plainSchemeURL = try XCTUnwrap(URL(string: "swiftflash://file\(encodedPath)"))
+        XCTAssertEqual(
+            WorkspaceState.parseExternalURL(plainSchemeURL),
+            ExternalOpenTarget(url: fileURL.standardized, line: nil)
+        )
+
+        let lineSchemeURL = try XCTUnwrap(URL(string: "swiftflash://file\(encodedPath):42"))
+        XCTAssertEqual(
+            WorkspaceState.parseExternalURL(lineSchemeURL),
+            ExternalOpenTarget(url: fileURL.standardized, line: 42)
+        )
+
+        let lineColSchemeURL = try XCTUnwrap(URL(string: "swiftflash://file\(encodedPath):42:8"))
+        XCTAssertEqual(
+            WorkspaceState.parseExternalURL(lineColSchemeURL),
+            ExternalOpenTarget(url: fileURL.standardized, line: 42)
+        )
+
+        var openComponents = URLComponents()
+        openComponents.scheme = "swiftflash"
+        openComponents.host = "open"
+        openComponents.queryItems = [
+            URLQueryItem(name: "path", value: fileURL.path),
+            URLQueryItem(name: "line", value: "15")
+        ]
+        let openSchemeURL = try XCTUnwrap(openComponents.url)
+        XCTAssertEqual(
+            WorkspaceState.parseExternalURL(openSchemeURL),
+            ExternalOpenTarget(url: fileURL.standardized, line: 15)
+        )
+
+        let rejectedURL = try XCTUnwrap(URL(string: "https://example.com/demo.swift"))
+        XCTAssertNil(WorkspaceState.parseExternalURL(rejectedURL))
+    }
+
+    @MainActor
+    func testOpenExternalURLsOpensSingleFileWithoutPollutingRecentProjects() throws {
+        let tempDir = try makeTempDirectory(name: "single-file-\(UUID().uuidString)")
+        let fileURL = tempDir.appendingPathComponent("standalone.swift")
+        try "print(\"hello\")\n".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let defaults = makeIsolatedDefaults()
+        let workspace = WorkspaceState(initialURL: nil, userDefaults: defaults)
+        XCTAssertFalse(workspace.hasWorkspaceOpen)
+
+        workspace.openExternalURLs([fileURL])
+
+        XCTAssertFalse(workspace.hasWorkspaceOpen)
+        XCTAssertTrue(workspace.recentProjects.isEmpty)
+        XCTAssertEqual(workspace.openTabs.count, 1)
+        XCTAssertEqual(workspace.activeTab?.url?.standardized.path, fileURL.standardized.path)
+        XCTAssertEqual(workspace.activeTab?.content, "print(\"hello\")\n")
+
+        let unstandardizedURL = tempDir
+            .appendingPathComponent(".", isDirectory: true)
+            .appendingPathComponent("standalone.swift")
+        workspace.openExternalURLs([unstandardizedURL])
+
+        XCTAssertEqual(workspace.openTabs.count, 1)
+        XCTAssertEqual(workspace.activeTab?.url?.standardized.path, fileURL.standardized.path)
+    }
+
+    @MainActor
+    func testOpenExternalURLsSwitchesDirectoryAndOpensFile() throws {
+        let tempDir = try makeTempDirectory(name: "dir-and-file-\(UUID().uuidString)")
+        let fileA = tempDir.appendingPathComponent("Alpha.swift")
+        let fileB = tempDir.appendingPathComponent("Target.swift")
+        try "let a = 1\n".write(to: fileA, atomically: true, encoding: .utf8)
+        try "let b = 2\n".write(to: fileB, atomically: true, encoding: .utf8)
+
+        let defaults = makeIsolatedDefaults()
+        let workspace = WorkspaceState(initialURL: nil, userDefaults: defaults)
+
+        workspace.openExternalURLs([tempDir, fileB])
+
+        XCTAssertTrue(workspace.hasWorkspaceOpen)
+        XCTAssertEqual(workspace.rootURL.standardized.path, tempDir.standardized.path)
+        XCTAssertEqual(workspace.activeTab?.url?.standardized.path, fileB.standardized.path)
+        XCTAssertEqual(workspace.activeTab?.content, "let b = 2\n")
+    }
+
+    func testParseLaunchArgumentsFiltersSystemFlagsAndAcceptsPathsAndSchemes() throws {
+        let tempDir = try makeTempDirectory(name: "launch-args-\(UUID().uuidString)")
+        let fileURL = tempDir.appendingPathComponent("main.swift")
+        try "// entry\n".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let schemeString = "swiftflash://file\(fileURL.path):10"
+        let parsed = AppDelegate.parseLaunchArguments([
+            "-psn_0_12345",
+            "-NSDocumentRevisionsDebugMode",
+            tempDir.path,
+            fileURL.path,
+            schemeString,
+            tempDir.appendingPathComponent("does-not-exist.swift").path
+        ])
+
+        XCTAssertEqual(parsed.count, 3)
+        XCTAssertEqual(parsed[0].standardized.path, tempDir.standardized.path)
+        XCTAssertEqual(parsed[1].standardized.path, fileURL.standardized.path)
+        XCTAssertEqual(parsed[2].absoluteString, schemeString)
+    }
 }

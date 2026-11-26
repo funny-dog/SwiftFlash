@@ -6,7 +6,6 @@ enum ProjectTaskKind: String, Equatable, Sendable {
     case run
     case test
     case build
-    case custom
 }
 
 struct ProjectTask: Identifiable, Equatable, Sendable {
@@ -66,10 +65,12 @@ enum ProjectTaskDetector {
                 } else {
                     kind = .run
                 }
-                let cmd = runner == "npm run" && scriptName == "test" ? "npm test" : "\(runner) \(scriptName)"
+                let displayName = runner == "npm run" && scriptName == "test" ? "npm test" : "\(runner) \(scriptName)"
+                let safeArg = isSafeBareShellToken(scriptName) ? scriptName : shellQuoted(scriptName)
+                let cmd = runner == "npm run" && scriptName == "test" ? "npm test" : "\(runner) \(safeArg)"
                 tasks.append(ProjectTask(
                     id: "node-\(scriptName)",
-                    name: cmd,
+                    name: displayName,
                     command: cmd,
                     kind: kind,
                     sourceLabel: "package.json"
@@ -153,37 +154,54 @@ enum ProjectTaskDetector {
         return tasks
     }
 
-    private static func shellQuoted(_ path: String) -> String {
-        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func isSafeBareShellToken(_ token: String) -> Bool {
+        guard !token.isEmpty else { return false }
+        return token.unicodeScalars.allSatisfy { s in
+            (s.value >= 48 && s.value <= 57)     // 0-9
+                || (s.value >= 65 && s.value <= 90)  // A-Z
+                || (s.value >= 97 && s.value <= 122) // a-z
+                || s == "_" || s == "-" || s == "." || s == ":"
+        }
     }
 }
 
 // MARK: - Compiler / Runtime Output Location Parser
 
-struct ParsedOutputLocation: Equatable {
+struct ParsedOutputLocation: Equatable, Sendable {
     let url: URL
     let line: Int
     let column: Int?
 }
 
 enum OutputLocationParser {
-    private static let patterns: [(regex: NSRegularExpression, fileGroup: Int, lineGroup: Int, colGroup: Int?)] = {
-        var list: [(NSRegularExpression, Int, Int, Int?)] = []
+    private struct PatternEntry: @unchecked Sendable {
+        let regex: NSRegularExpression
+        let fileGroup: Int
+        let lineGroup: Int
+        let colGroup: Int?
+    }
+
+    private static let patterns: [PatternEntry] = {
+        var list: [PatternEntry] = []
         // 1. Python traceback: File "/path/foo.py", line 42
         if let r = try? NSRegularExpression(pattern: #"File "([^"]+)", line (\d+)"#) {
-            list.append((r, 1, 2, nil))
+            list.append(PatternEntry(regex: r, fileGroup: 1, lineGroup: 2, colGroup: nil))
         }
         // 2. Rust arrow: --> src/main.rs:12:5
         if let r = try? NSRegularExpression(pattern: #"-->\s*([^\s:]+):(\d+):(\d+)"#) {
-            list.append((r, 1, 2, 3))
+            list.append(PatternEntry(regex: r, fileGroup: 1, lineGroup: 2, colGroup: 3))
         }
         // 3. TypeScript/MSBuild: src/app.ts(12,5)
         if let r = try? NSRegularExpression(pattern: #"([^\s(:]+)\((\d+),(\d+)\)"#) {
-            list.append((r, 1, 2, 3))
+            list.append(PatternEntry(regex: r, fileGroup: 1, lineGroup: 2, colGroup: 3))
         }
         // 4. Generic path:line:col or path:line (Swift, Clang, Go, Jest, etc.)
         if let r = try? NSRegularExpression(pattern: #"([A-Za-z0-9_./-]+\.[A-Za-z0-9]+):(\d+)(?::(\d+))?"#) {
-            list.append((r, 1, 2, 3))
+            list.append(PatternEntry(regex: r, fileGroup: 1, lineGroup: 2, colGroup: 3))
         }
         return list
     }()
@@ -223,7 +241,7 @@ enum OutputLocationParser {
 
 // MARK: - Task Runner State
 
-struct TaskOutputLine: Identifiable, Equatable {
+struct TaskOutputLine: Identifiable, Equatable, Sendable {
     let id = UUID()
     let text: String
     let isError: Bool
@@ -238,8 +256,10 @@ final class TaskRunnerState: ObservableObject {
     @Published var activeTaskName: String = ""
     @Published var lastExitCode: Int32?
     @Published var outputLines: [TaskOutputLine] = []
+    @Published private(set) var outputRevision: Int = 0
 
     private var activeProcess: Process?
+    private var activeRunToken: UUID?
 
     var selectedTask: ProjectTask? {
         if let selectedTaskID, let found = detectedTasks.first(where: { $0.id == selectedTaskID }) {
@@ -284,6 +304,8 @@ final class TaskRunnerState: ObservableObject {
             stop()
         }
 
+        let runToken = UUID()
+        activeRunToken = runToken
         selectedTaskID = task.id
         isRunning = true
         activeTaskName = task.name
@@ -291,6 +313,7 @@ final class TaskRunnerState: ObservableObject {
         outputLines = [
             TaskOutputLine(text: "$ \(task.command)", isError: false, location: nil)
         ]
+        outputRevision &+= 1
 
         let root = workspaceRoot
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -299,48 +322,79 @@ final class TaskRunnerState: ObservableObject {
             proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
             proc.arguments = ["-l", "-c", task.command]
             proc.currentDirectoryURL = root
-
-            var env = ProcessInfo.processInfo.environment
-            let extraBins = [
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-                FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cargo/bin").path,
-                FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("go/bin").path
-            ]
-            env["PATH"] = (extraBins + [env["PATH"] ?? "/usr/bin:/bin"]).joined(separator: ":")
-            proc.environment = env
+            proc.environment = ToolchainEnvironment.augmentedEnvironment()
 
             let outPipe = Pipe()
             let errPipe = Pipe()
             proc.standardOutput = outPipe
             proc.standardError = errPipe
 
-            await MainActor.run {
-                weakSelf?.activeProcess = proc
+            final class DecoderState: @unchecked Sendable {
+                private let lock = NSLock()
+                private var outDecoder = IncrementalLineDecoder()
+                private var errDecoder = IncrementalLineDecoder()
+
+                func append(_ data: Data, isError: Bool) -> [String] {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    return isError ? errDecoder.append(data) : outDecoder.append(data)
+                }
+
+                func flush(isError: Bool) -> [String] {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    return isError ? errDecoder.flush() : outDecoder.flush()
+                }
             }
+
+            let decoderState = DecoderState()
+            let emitParsedLines: @Sendable ([String], Bool) -> Void = { rawLines, isError in
+                guard !rawLines.isEmpty else { return }
+                let parsed = rawLines.map { line in
+                    TaskOutputLine(
+                        text: line,
+                        isError: isError,
+                        location: OutputLocationParser.parseLocation(from: line, workspaceRoot: root)
+                    )
+                }
+                Task { @MainActor in
+                    weakSelf?.appendLines(parsed, for: runToken)
+                }
+            }
+
+            let shouldProceed = await MainActor.run { () -> Bool in
+                guard let strongSelf = weakSelf, strongSelf.activeRunToken == runToken else {
+                    return false
+                }
+                strongSelf.activeProcess = proc
+                return true
+            }
+            guard shouldProceed else { return }
 
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                Task { @MainActor in
-                    weakSelf?.appendChunk(chunk, isError: false, workspaceRoot: root)
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
                 }
+                emitParsedLines(decoderState.append(data, isError: false), false)
             }
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                Task { @MainActor in
-                    weakSelf?.appendChunk(chunk, isError: true, workspaceRoot: root)
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
                 }
+                emitParsedLines(decoderState.append(data, isError: true), true)
             }
 
             do {
                 try proc.run()
                 proc.waitUntilExit()
             } catch {
-                let errText = error.localizedDescription
+                let errLine = TaskOutputLine(text: error.localizedDescription, isError: true, location: nil)
                 await MainActor.run {
-                    weakSelf?.appendChunk(errText, isError: true, workspaceRoot: root)
+                    weakSelf?.appendLines([errLine], for: runToken)
                 }
             }
 
@@ -348,56 +402,66 @@ final class TaskRunnerState: ObservableObject {
             errPipe.fileHandleForReading.readabilityHandler = nil
 
             let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
-            if !remainingOut.isEmpty, let str = String(data: remainingOut, encoding: .utf8) {
+            let tailOut = decoderState.append(remainingOut, isError: false) + decoderState.flush(isError: false)
+            if !tailOut.isEmpty {
+                let parsed = tailOut.map {
+                    TaskOutputLine(text: $0, isError: false, location: OutputLocationParser.parseLocation(from: $0, workspaceRoot: root))
+                }
                 await MainActor.run {
-                    weakSelf?.appendChunk(str, isError: false, workspaceRoot: root)
+                    weakSelf?.appendLines(parsed, for: runToken)
                 }
             }
+
             let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
-            if !remainingErr.isEmpty, let str = String(data: remainingErr, encoding: .utf8) {
+            let tailErr = decoderState.append(remainingErr, isError: true) + decoderState.flush(isError: true)
+            if !tailErr.isEmpty {
+                let parsed = tailErr.map {
+                    TaskOutputLine(text: $0, isError: true, location: OutputLocationParser.parseLocation(from: $0, workspaceRoot: root))
+                }
                 await MainActor.run {
-                    weakSelf?.appendChunk(str, isError: true, workspaceRoot: root)
+                    weakSelf?.appendLines(parsed, for: runToken)
                 }
             }
 
             let status = proc.terminationStatus
             await MainActor.run {
-                guard let strongSelf = weakSelf else { return }
+                guard let strongSelf = weakSelf, strongSelf.activeRunToken == runToken else { return }
                 strongSelf.isRunning = false
                 strongSelf.activeProcess = nil
                 strongSelf.lastExitCode = status
-                strongSelf.outputLines.append(
-                    TaskOutputLine(
+                strongSelf.appendLines(
+                    [TaskOutputLine(
                         text: L10n("runner.exitCodeFormat", Int(status)),
                         isError: status != 0,
                         location: nil
-                    )
+                    )],
+                    for: runToken
                 )
             }
         }
     }
 
     func stop() {
+        activeRunToken = nil
         if let proc = activeProcess, proc.isRunning {
-            proc.interrupt()
-            proc.terminate()
+            ProcessRunner.terminateProcessTree(rootPID: proc.processIdentifier)
         }
+        activeProcess = nil
         isRunning = false
     }
 
     func clear() {
         outputLines.removeAll()
         lastExitCode = nil
+        outputRevision &+= 1
     }
 
-    private func appendChunk(_ chunk: String, isError: Bool, workspaceRoot: URL) {
-        let lines = chunk.components(separatedBy: .newlines)
-        for line in lines where !line.isEmpty {
-            let loc = OutputLocationParser.parseLocation(from: line, workspaceRoot: workspaceRoot)
-            outputLines.append(TaskOutputLine(text: line, isError: isError, location: loc))
-        }
+    private func appendLines(_ newLines: [TaskOutputLine], for runToken: UUID) {
+        guard activeRunToken == runToken, !newLines.isEmpty else { return }
+        outputLines.append(contentsOf: newLines)
         if outputLines.count > 2500 {
             outputLines.removeFirst(outputLines.count - 2500)
         }
+        outputRevision &+= 1
     }
 }

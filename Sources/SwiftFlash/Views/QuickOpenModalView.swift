@@ -2,36 +2,21 @@ import AppKit
 import SwiftUI
 
 struct QuickOpenModalView: View {
+    private struct MatchEntry: Identifiable {
+        var id: URL { url }
+        let url: URL
+        let relativePath: String
+        let score: Int
+    }
+
     @ObservedObject var workspace: WorkspaceState
     @ObservedObject private var themeManager = ThemeManager.shared
     @State private var query: String = ""
     @State private var selectedIndex: Int = 0
+    @State private var cachedResults: [MatchEntry] = []
+    @State private var countBox = SwitcherCountBox()
     @State private var eventMonitor: Any?
     @FocusState private var isInputFocused: Bool
-
-    private var filteredFiles: [(url: URL, relativePath: String, score: Int)] {
-        let rootPath = workspace.rootURL.path
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let mapped: [(url: URL, relativePath: String, score: Int)] = workspace.allWorkspaceFiles.compactMap { url in
-            let rel = url.path.hasPrefix(rootPath + "/")
-                ? String(url.path.dropFirst(rootPath.count + 1))
-                : url.lastPathComponent
-
-            if trimmed.isEmpty {
-                return (url, rel, 1)
-            }
-            if let score = Self.fuzzyScore(query: trimmed, candidate: rel) {
-                return (url, rel, score)
-            }
-            return nil
-        }
-
-        if trimmed.isEmpty {
-            return Array(mapped.prefix(40))
-        }
-        return Array(mapped.sorted { $0.score > $1.score }.prefix(40))
-    }
 
     var body: some View {
         ZStack {
@@ -57,7 +42,7 @@ struct QuickOpenModalView: View {
                             openSelected()
                         }
                         .onChange(of: query) { _, _ in
-                            selectedIndex = 0
+                            recomputeFilteredFiles()
                         }
 
                     Text("ESC")
@@ -75,8 +60,7 @@ struct QuickOpenModalView: View {
                     .overlay(Color(nsColor: ZedTheme.border))
 
                 // Results List
-                let items = filteredFiles
-                if items.isEmpty {
+                if cachedResults.isEmpty {
                     VStack(spacing: 6) {
                         Text(L10n("quickOpen.empty"))
                             .font(.system(size: 12.5))
@@ -88,7 +72,7 @@ struct QuickOpenModalView: View {
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(spacing: 2) {
-                                ForEach(Array(items.enumerated()), id: \.element.url) { idx, item in
+                                ForEach(Array(cachedResults.enumerated()), id: \.offset) { idx, item in
                                     let lang = CodeLanguage.detect(from: item.url)
                                     let isSelected = idx == selectedIndex
                                     Button {
@@ -128,7 +112,6 @@ struct QuickOpenModalView: View {
                                         )
                                     }
                                     .buttonStyle(.plain)
-                                    .id(idx)
                                 }
                             }
                             .padding(6)
@@ -154,31 +137,69 @@ struct QuickOpenModalView: View {
         .onAppear {
             query = ""
             selectedIndex = 0
+            recomputeFilteredFiles()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
                 isInputFocused = true
             }
             installKeyMonitor()
+        }
+        .onChange(of: workspace.allWorkspaceFiles) { _, _ in
+            recomputeFilteredFiles()
         }
         .onDisappear {
             removeKeyMonitor()
         }
     }
 
+    private func recomputeFilteredFiles() {
+        let rootPath = workspace.rootURL.path
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let computed: [MatchEntry]
+        if trimmed.isEmpty {
+            computed = workspace.allWorkspaceFiles.prefix(40).map { url in
+                let rel = url.path.hasPrefix(rootPath + "/")
+                    ? String(url.path.dropFirst(rootPath.count + 1))
+                    : url.lastPathComponent
+                return MatchEntry(url: url, relativePath: rel, score: 1)
+            }
+        } else {
+            let mapped: [MatchEntry] = workspace.allWorkspaceFiles.compactMap { url in
+                let rel = url.path.hasPrefix(rootPath + "/")
+                    ? String(url.path.dropFirst(rootPath.count + 1))
+                    : url.lastPathComponent
+                guard let score = Self.fuzzyScore(query: trimmed, candidate: rel) else { return nil }
+                return MatchEntry(url: url, relativePath: rel, score: score)
+            }
+            computed = Array(mapped.sorted { $0.score > $1.score }.prefix(40))
+        }
+
+        cachedResults = computed
+        countBox.count = computed.count
+        selectedIndex = 0
+    }
+
     private func installKeyMonitor() {
         removeKeyMonitor()
+        let box = countBox
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Respect IME composition and ignore events targeting other windows.
+            guard event.window === NSApp.keyWindow,
+                  !SwitcherKeyboardSupport.hasActiveMarkedText() else {
+                return event
+            }
             switch Int(event.keyCode) {
             case 53: // Escape
                 dismiss()
                 return nil
             case 125: // Down Arrow
-                let count = filteredFiles.count
+                let count = box.count
                 if count > 0 {
                     selectedIndex = min(selectedIndex + 1, count - 1)
                 }
                 return nil
             case 126: // Up Arrow
-                if !filteredFiles.isEmpty {
+                if box.count > 0 {
                     selectedIndex = max(selectedIndex - 1, 0)
                 }
                 return nil
@@ -196,10 +217,9 @@ struct QuickOpenModalView: View {
     }
 
     private func openSelected() {
-        let items = filteredFiles
-        guard !items.isEmpty else { return }
-        let idx = min(max(0, selectedIndex), items.count - 1)
-        workspace.openFile(url: items[idx].url)
+        guard !cachedResults.isEmpty else { return }
+        let idx = min(max(0, selectedIndex), cachedResults.count - 1)
+        workspace.openFile(url: cachedResults[idx].url)
         dismiss()
     }
 
@@ -207,9 +227,13 @@ struct QuickOpenModalView: View {
         workspace.dismissOverlay()
     }
 
-    private static func fuzzyScore(query: String, candidate: String) -> Int? {
-        let qChars = Array(query.lowercased())
-        let cChars = Array(candidate.lowercased())
+    /// Unicode-safe fuzzy file matcher operating strictly on original character indices
+    /// (never mixes indices from `candidate` and `candidate.lowercased()`).
+    nonisolated static func fuzzyScore(query: String, candidate: String) -> Int? {
+        let qLower = query.lowercased()
+        let qChars = Array(qLower)
+        guard !qChars.isEmpty else { return 1 }
+
         let origChars = Array(candidate)
         let fileName = (candidate as NSString).lastPathComponent.lowercased()
 
@@ -217,25 +241,45 @@ struct QuickOpenModalView: View {
         var score = 0
         var consecutive = 0
 
-        for ci in 0..<cChars.count {
-            if qi < qChars.count && cChars[ci] == qChars[qi] {
+        for ci in 0..<origChars.count {
+            let origChar = origChars[ci]
+            let loweredSegment = origChar.lowercased()
+            var matched = false
+            if qi < qChars.count {
+                // Handle both 1-to-1 and rare 1-to-N Unicode lowercase expansions safely.
+                let segChars = Array(loweredSegment)
+                if segChars.count == 1 {
+                    if segChars[0] == qChars[qi] {
+                        matched = true
+                        qi += 1
+                    }
+                } else if qi + segChars.count <= qChars.count
+                            && Array(qChars[qi..<(qi + segChars.count)]) == segChars {
+                    matched = true
+                    qi += segChars.count
+                }
+            }
+
+            if matched {
                 consecutive += 1
                 score += 10 + consecutive * 6
-                // Bonus for start of path segment or camelCase hump
-                if ci == 0 || cChars[ci - 1] == "/" || cChars[ci - 1] == "_" || cChars[ci - 1] == "-" || origChars[ci].isUppercase {
+                let isBoundary = ci == 0
+                    || origChars[ci - 1] == "/"
+                    || origChars[ci - 1] == "_"
+                    || origChars[ci - 1] == "-"
+                    || origChar.isUppercase
+                if isBoundary {
                     score += 15
                 }
-                qi += 1
             } else {
                 consecutive = 0
             }
         }
 
         guard qi == qChars.count else { return nil }
-        if fileName.contains(query.lowercased()) {
+        if fileName.contains(qLower) {
             score += 40
         }
-        // Slightly prefer shorter paths on tie
         score -= candidate.count / 6
         return score
     }

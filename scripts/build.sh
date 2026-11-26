@@ -34,8 +34,6 @@ cp "$BIN_DIR/SwiftFlash" "$MACOS_DIR/SwiftFlash"
 cp "$PLIST_PATH" "$CONTENTS_DIR/Info.plist"
 echo -n "APPL????" > "$CONTENTS_DIR/PkgInfo"
 
-cp "$PROJECT_DIR/Sources/SwiftFlash/Resources/AppIcon-Light.png" "$RESOURCES_DIR/AppIcon-Light.png"
-cp "$PROJECT_DIR/Sources/SwiftFlash/Resources/AppIcon-Dark.png" "$RESOURCES_DIR/AppIcon-Dark.png"
 if [ -d "$BIN_DIR/SwiftFlash_SwiftFlash.bundle" ]; then
   cp -R "$BIN_DIR/SwiftFlash_SwiftFlash.bundle" "$RESOURCES_DIR/"
 fi
@@ -52,9 +50,13 @@ if command -v xcrun >/dev/null 2>&1 && xcrun --find actool >/dev/null 2>&1; then
   rm -f "$ACTOOL_PLIST"
 fi
 
-# 硬校验：应用图标资源必须打进 bundle
-if [ ! -f "$RESOURCES_DIR/AppIcon-Light.png" ] || [ ! -f "$RESOURCES_DIR/AppIcon-Dark.png" ]; then
-  echo "错误：缺少 AppIcon-Light.png 或 AppIcon-Dark.png" >&2
+# 硬校验：应用图标资源必须打进 SwiftFlash_SwiftFlash.bundle（避免在 Contents/Resources 下重复打包两份）
+BUNDLE_RES_DIR="$RESOURCES_DIR/SwiftFlash_SwiftFlash.bundle/Contents/Resources"
+if [ ! -d "$BUNDLE_RES_DIR" ]; then
+  BUNDLE_RES_DIR="$RESOURCES_DIR/SwiftFlash_SwiftFlash.bundle"
+fi
+if [ ! -f "$BUNDLE_RES_DIR/AppIcon-Light.png" ] || [ ! -f "$BUNDLE_RES_DIR/AppIcon-Dark.png" ]; then
+  echo "错误：SwiftFlash_SwiftFlash.bundle 缺少 AppIcon-Light.png 或 AppIcon-Dark.png" >&2
   exit 1
 fi
 if command -v xcrun >/dev/null 2>&1 && xcrun --find actool >/dev/null 2>&1; then
