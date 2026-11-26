@@ -274,4 +274,198 @@ final class FlashTextView: TextView {
             selectionManager.setSelectedRange(updatedRange)
         }
     }
+
+    // MARK: - Line Editing & Multi-Cursor (⌘D, ⌥↑/↓, ⌥⇧↑/↓, ⌘⇧K, ⌘↵)
+
+    func selectNextOccurrence() {
+        let nsString = textStorage.string as NSString
+        guard nsString.length > 0 else { return }
+
+        let currentRanges = selectionManager.textSelections.map(\.range).sorted { $0.location < $1.location }
+        guard let firstRange = currentRanges.first else { return }
+
+        // If cursor has no selection, expand to the word under cursor.
+        if currentRanges.count == 1 && firstRange.length == 0 {
+            let wordRange = wordRangeAt(offset: firstRange.location, in: nsString)
+            if wordRange.length > 0 {
+                selectionManager.setSelectedRange(wordRange)
+                scrollToRange(wordRange, center: false)
+            }
+            return
+        }
+
+        let needle = nsString.substring(with: firstRange)
+        guard !needle.isEmpty else { return }
+
+        let lastSelected = currentRanges.last ?? firstRange
+        let searchStart = lastSelected.location + lastSelected.length
+        var found = NSRange(location: NSNotFound, length: 0)
+
+        if searchStart < nsString.length {
+            let tail = NSRange(location: searchStart, length: nsString.length - searchStart)
+            found = nsString.range(of: needle, options: [], range: tail)
+        }
+        // Wrap around to top of document if not found below.
+        if found.location == NSNotFound && firstRange.location > 0 {
+            let head = NSRange(location: 0, length: firstRange.location)
+            found = nsString.range(of: needle, options: [], range: head)
+        }
+
+        guard found.location != NSNotFound else { return }
+        if currentRanges.contains(where: { $0 == found }) {
+            return
+        }
+        var updated = currentRanges
+        updated.append(found)
+        updated.sort { $0.location < $1.location }
+        selectionManager.setSelectedRanges(updated)
+        scrollToRange(found, center: false)
+    }
+
+    func moveSelectedLines(up: Bool) {
+        guard isEditable else { return }
+        let nsString = textStorage.string as NSString
+        guard nsString.length > 0, let sel = selectionManager.textSelections.first?.range else { return }
+
+        let blockRange = nsString.lineRange(for: sel)
+        if up {
+            guard blockRange.location > 0 else { return }
+            let prevRange = nsString.lineRange(for: NSRange(location: blockRange.location - 1, length: 0))
+            let prevText = nsString.substring(with: prevRange)
+            let blockText = nsString.substring(with: blockRange)
+            let combinedRange = NSRange(location: prevRange.location, length: prevRange.length + blockRange.length)
+
+            let replacement: String
+            let newSelLocation: Int
+            if !blockText.hasSuffix("\n") && prevText.hasSuffix("\n") {
+                let trimmedPrev = String(prevText.dropLast())
+                replacement = blockText + "\n" + trimmedPrev
+                newSelLocation = sel.location - prevRange.length
+            } else {
+                replacement = blockText + prevText
+                newSelLocation = sel.location - prevRange.length
+            }
+
+            replaceCharacters(in: combinedRange, with: replacement, skipUpdateSelection: true)
+            let clampedLoc = max(0, min(newSelLocation, textStorage.length))
+            let clampedLen = min(sel.length, max(0, textStorage.length - clampedLoc))
+            selectionManager.setSelectedRange(NSRange(location: clampedLoc, length: clampedLen))
+            scrollSelectionToVisible()
+        } else {
+            let blockEnd = blockRange.location + blockRange.length
+            guard blockEnd < nsString.length else { return }
+            let nextRange = nsString.lineRange(for: NSRange(location: blockEnd, length: 0))
+            let blockText = nsString.substring(with: blockRange)
+            let nextText = nsString.substring(with: nextRange)
+            let combinedRange = NSRange(location: blockRange.location, length: blockRange.length + nextRange.length)
+
+            let replacement: String
+            let delta: Int
+            if !nextText.hasSuffix("\n") && blockText.hasSuffix("\n") {
+                let trimmedBlock = String(blockText.dropLast())
+                replacement = nextText + "\n" + trimmedBlock
+                delta = (nextText as NSString).length + 1
+            } else {
+                replacement = nextText + blockText
+                delta = nextRange.length
+            }
+
+            replaceCharacters(in: combinedRange, with: replacement, skipUpdateSelection: true)
+            let clampedLoc = max(0, min(sel.location + delta, textStorage.length))
+            let clampedLen = min(sel.length, max(0, textStorage.length - clampedLoc))
+            selectionManager.setSelectedRange(NSRange(location: clampedLoc, length: clampedLen))
+            scrollSelectionToVisible()
+        }
+    }
+
+    func duplicateSelectedLines(up: Bool) {
+        guard isEditable else { return }
+        let nsString = textStorage.string as NSString
+        guard let sel = selectionManager.textSelections.first?.range else { return }
+
+        let blockRange = nsString.lineRange(for: sel)
+        let blockText = nsString.substring(with: blockRange)
+        let hasTrailingNewline = blockText.hasSuffix("\n")
+        let normalizedBlock = hasTrailingNewline ? blockText : (blockText + "\n")
+
+        if up {
+            replaceCharacters(in: NSRange(location: blockRange.location, length: 0), with: normalizedBlock, skipUpdateSelection: true)
+            selectionManager.setSelectedRange(sel)
+        } else {
+            let insertLoc = blockRange.location + blockRange.length
+            let insertion = hasTrailingNewline ? blockText : ("\n" + blockText)
+            let delta = hasTrailingNewline ? blockRange.length : ((blockText as NSString).length + 1)
+            replaceCharacters(in: NSRange(location: insertLoc, length: 0), with: insertion, skipUpdateSelection: true)
+            let newLoc = min(sel.location + delta, textStorage.length)
+            let newLen = min(sel.length, max(0, textStorage.length - newLoc))
+            selectionManager.setSelectedRange(NSRange(location: newLoc, length: newLen))
+        }
+        scrollSelectionToVisible()
+    }
+
+    func deleteSelectedLines() {
+        guard isEditable else { return }
+        let nsString = textStorage.string as NSString
+        guard nsString.length > 0, let sel = selectionManager.textSelections.first?.range else { return }
+
+        var blockRange = nsString.lineRange(for: sel)
+        // If deleting the last line that has no trailing newline, also eat the preceding newline.
+        if blockRange.location + blockRange.length == nsString.length,
+           blockRange.location > 0,
+           !nsString.substring(with: blockRange).hasSuffix("\n") {
+            blockRange = NSRange(location: blockRange.location - 1, length: blockRange.length + 1)
+        }
+
+        replaceCharacters(in: blockRange, with: "", skipUpdateSelection: true)
+        let newLoc = min(blockRange.location, textStorage.length)
+        selectionManager.setSelectedRange(NSRange(location: newLoc, length: 0))
+        scrollSelectionToVisible()
+    }
+
+    func insertLine(above: Bool) {
+        guard isEditable else { return }
+        let nsString = textStorage.string as NSString
+        guard let sel = selectionManager.textSelections.first?.range else { return }
+
+        let lineRange = nsString.lineRange(for: NSRange(location: sel.location, length: 0))
+        let lineText = nsString.substring(with: lineRange)
+        let indent = String(lineText.prefix(while: { $0 == " " || $0 == "\t" }))
+
+        if above {
+            let insertion = indent + "\n"
+            replaceCharacters(in: NSRange(location: lineRange.location, length: 0), with: insertion, skipUpdateSelection: true)
+            let cursorLoc = lineRange.location + (indent as NSString).length
+            selectionManager.setSelectedRange(NSRange(location: cursorLoc, length: 0))
+        } else {
+            let hasNewline = lineText.hasSuffix("\n")
+            let insertLoc = hasNewline ? (lineRange.location + lineRange.length - 1) : (lineRange.location + lineRange.length)
+            let insertion = "\n" + indent
+            replaceCharacters(in: NSRange(location: insertLoc, length: 0), with: insertion, skipUpdateSelection: true)
+            let cursorLoc = insertLoc + 1 + (indent as NSString).length
+            selectionManager.setSelectedRange(NSRange(location: cursorLoc, length: 0))
+        }
+        scrollSelectionToVisible()
+    }
+
+    private func wordRangeAt(offset: Int, in nsString: NSString) -> NSRange {
+        let len = nsString.length
+        guard len > 0 else { return NSRange(location: 0, length: 0) }
+        var pos = min(max(0, offset), len)
+        if pos == len || !LocalCompletionProvider.isIdentifierChar(nsString.character(at: pos)) {
+            if pos > 0 && LocalCompletionProvider.isIdentifierChar(nsString.character(at: pos - 1)) {
+                pos -= 1
+            } else {
+                return NSRange(location: offset, length: 0)
+            }
+        }
+        var start = pos
+        while start > 0 && LocalCompletionProvider.isIdentifierChar(nsString.character(at: start - 1)) {
+            start -= 1
+        }
+        var end = pos + 1
+        while end < len && LocalCompletionProvider.isIdentifierChar(nsString.character(at: end)) {
+            end += 1
+        }
+        return NSRange(location: start, length: end - start)
+    }
 }

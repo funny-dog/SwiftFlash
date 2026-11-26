@@ -51,10 +51,67 @@ private final class EditorResourceBag: @unchecked Sendable {
     }
 }
 
+// MARK: - LSP Hover Popup State & View
+
+@MainActor
+final class HoverPopupState: ObservableObject {
+    @Published var isVisible: Bool = false
+    @Published var markdownText: String = ""
+
+    func show(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            dismiss()
+            return
+        }
+        markdownText = trimmed
+        isVisible = true
+    }
+
+    func dismiss() {
+        isVisible = false
+        markdownText = ""
+    }
+}
+
+struct HoverPopupView: View {
+    @ObservedObject var state: HoverPopupState
+    @ObservedObject private var themeManager = ThemeManager.shared
+
+    var body: some View {
+        ScrollView {
+            Text(renderedHoverText)
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundColor(Color(nsColor: ZedTheme.primaryText))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+        }
+        .frame(maxWidth: 460, maxHeight: 220)
+        .background(Color(nsColor: ZedTheme.sidebarBackground))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: ZedTheme.border), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(ZedTheme.isDark ? 0.48 : 0.2), radius: 14, y: 6)
+    }
+
+    private var renderedHoverText: String {
+        // Strip markdown fenced code markers cleanly so hover reads crisply in monospace.
+        state.markdownText
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 // MARK: - Container View (Gutter + ScrollView + FlashTextView + Incremental Async Highlighter)
 
 @MainActor
 final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
+    let pane: EditorPane
     let gutterView = EditorGutterView()
     let scrollView = NSScrollView()
     let textView: FlashTextView
@@ -62,6 +119,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     weak var workspace: WorkspaceState?
 
     private var currentTabID: UUID?
+    private var currentTabURL: URL?
     private var currentReloadRevision: Int = 0
     private var currentLanguage: CodeLanguage = .swift
     private var isProgrammaticUpdate = false
@@ -69,7 +127,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     private var needsHighlightAfterIME = false
     private var highlightTask: Task<Void, Never>?
     private var completionTask: Task<Void, Never>?
+    private var hoverTask: Task<Void, Never>?
     private var completionRevision: Int = 0
+    private var hoverRevision: Int = 0
+    private var lastHoverOffset: Int = -1
+    private var hoverTrackingArea: NSTrackingArea?
     private var pendingCompletionInsertedString: String?
     private var gutterWidthConstraint: NSLayoutConstraint?
     private let resourceBag = EditorResourceBag()
@@ -78,12 +140,16 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     let completionState = CompletionState()
     private var completionHostingView: NSHostingView<CompletionPopupView>?
 
+    let hoverState = HoverPopupState()
+    private var hoverHostingView: NSHostingView<HoverPopupView>?
+
     private var editorFont: NSFont {
         ThemeManager.shared.editorFont
     }
 
-    init(workspace: WorkspaceState) {
+    init(workspace: WorkspaceState, pane: EditorPane = .primary) {
         self.workspace = workspace
+        self.pane = pane
         let initialFont = ThemeManager.shared.editorFont
         let initialLineHeight = ThemeManager.shared.lineHeightMultiplier
         self.textView = FlashTextView(
@@ -112,13 +178,57 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     deinit {
         highlightTask?.cancel()
         completionTask?.cancel()
+        hoverTask?.cancel()
         resourceBag.teardown()
     }
 
     func teardown() {
         highlightTask?.cancel()
         completionTask?.cancel()
+        hoverTask?.cancel()
         resourceBag.teardown()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = hoverTrackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        guard workspace?.activeOverlay == OverlayPanelMode.none,
+              !completionState.isVisible else {
+            return
+        }
+        let ptInContainer = convert(event.locationInWindow, from: nil)
+        if let hoverView = hoverHostingView, !hoverView.isHidden, hoverView.frame.contains(ptInContainer) {
+            return
+        }
+        let pt = textView.convert(event.locationInWindow, from: nil)
+        guard textView.bounds.contains(pt),
+              let offset = textView.layoutManager.textOffsetAtPoint(pt) else {
+            dismissHover()
+            return
+        }
+        if abs(offset - lastHoverOffset) <= 1 && hoverState.isVisible {
+            return
+        }
+        scheduleHover(atOffset: offset)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        dismissHover()
     }
 
     private func setupUI() {
@@ -174,6 +284,14 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         hosting.isHidden = true
         addSubview(hosting, positioned: .above, relativeTo: scrollView)
         self.completionHostingView = hosting
+
+        let hoverHosting = NSHostingView(rootView: HoverPopupView(state: hoverState))
+        hoverHosting.wantsLayer = true
+        hoverHosting.layer?.zPosition = 490
+        hoverHosting.sizingOptions = []
+        hoverHosting.isHidden = true
+        addSubview(hoverHosting, positioned: .above, relativeTo: scrollView)
+        self.hoverHostingView = hoverHosting
     }
 
     private func setupObservers() {
@@ -209,7 +327,9 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 guard let self else { return }
                 self.gutterView.needsDisplay = true
                 // Stored in non-@Published tab view state so scrolling causes zero SwiftUI redraws.
-                self.workspace?.updateActiveTabScroll(y: self.scrollView.documentVisibleRect.origin.y)
+                if let tabID = self.currentTabID {
+                    self.workspace?.updateTabScroll(tabID: tabID, y: self.scrollView.documentVisibleRect.origin.y)
+                }
                 self.scheduleViewportHighlight(debounceMs: 12)
                 if self.workspace?.findState.isFindBarVisible == true {
                     self.updateFindEmphases()
@@ -217,6 +337,9 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 if self.completionState.isVisible {
                     self.completionState.dismiss()
                     self.completionHostingView?.isHidden = true
+                }
+                if self.hoverState.isVisible {
+                    self.dismissHover()
                 }
             }
         }
@@ -247,10 +370,20 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             }
 
             if event.type == .leftMouseDown {
+                let ptInContainer = self.convert(event.locationInWindow, from: nil)
+                if self.bounds.contains(ptInContainer) {
+                    if self.workspace?.focusedEditorPane != self.pane {
+                        self.workspace?.focusPane(self.pane)
+                    }
+                }
                 if let hosting = self.completionHostingView, !hosting.isHidden {
-                    let ptInContainer = self.convert(event.locationInWindow, from: nil)
                     if !hosting.frame.contains(ptInContainer) {
                         self.dismissCompletion()
+                    }
+                }
+                if let hoverHost = self.hoverHostingView, !hoverHost.isHidden {
+                    if !hoverHost.frame.contains(ptInContainer) {
+                        self.dismissHover()
                     }
                 }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -272,6 +405,13 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if self.hoverState.isVisible && Int(event.keyCode) == 53 {
+                self.dismissHover()
+                return nil
+            }
+            if self.hoverState.isVisible {
+                self.dismissHover()
+            }
 
             // Completion popup navigation & acceptance
             if self.completionState.isVisible {
@@ -306,11 +446,41 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 return nil
             }
 
-            // F12 (111): Go to Definition
-            if Int(event.keyCode) == 111 && modifiers.isEmpty {
+            // F12 (111): Go to Definition | Shift+F12: Find References
+            if Int(event.keyCode) == 111 {
                 let offset = self.textView.selectionManager.textSelections.first?.range.location ?? 0
-                self.goToDefinition(atOffset: offset)
-                return nil
+                if modifiers == [.shift] {
+                    self.findReferences(atOffset: offset)
+                    return nil
+                } else if modifiers.isEmpty {
+                    self.goToDefinition(atOffset: offset)
+                    return nil
+                }
+            }
+
+            // Option+Up (126) / Option+Down (125): Move lines; Option+Shift+Up/Down: Duplicate lines
+            if Int(event.keyCode) == 126 || Int(event.keyCode) == 125 {
+                let isUp = (Int(event.keyCode) == 126)
+                if modifiers == [.option] {
+                    self.textView.moveSelectedLines(up: isUp)
+                    return nil
+                }
+                if modifiers == [.option, .shift] {
+                    self.textView.duplicateSelectedLines(up: isUp)
+                    return nil
+                }
+            }
+
+            // Cmd+Enter / Cmd+Shift+Enter: Insert line below / above
+            if Int(event.keyCode) == 36 {
+                if modifiers == [.command] {
+                    self.textView.insertLine(above: false)
+                    return nil
+                }
+                if modifiers == [.command, .shift] {
+                    self.textView.insertLine(above: true)
+                    return nil
+                }
             }
 
             // Tab (48) & Shift+Tab
@@ -406,9 +576,28 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         scheduleViewportHighlight(debounceMs: 0)
     }
 
+    private var displayedTab: EditorTab? {
+        guard let workspace, let currentTabID else { return nil }
+        return workspace.openTabs.first { $0.id == currentTabID }
+    }
+
+    func syncExternalBufferChange(tabID: UUID, newContent: String) {
+        guard currentTabID == tabID, textView.string != newContent else { return }
+        let savedSel = textView.selectionManager.textSelections.first?.range ?? NSRange(location: 0, length: 0)
+        isProgrammaticUpdate = true
+        textView.setText(newContent)
+        let safeLoc = min(savedSel.location, textView.textStorage.length)
+        let safeLen = min(savedSel.length, max(0, textView.textStorage.length - safeLoc))
+        textView.selectionManager.setSelectedRange(NSRange(location: safeLoc, length: safeLen))
+        isProgrammaticUpdate = false
+        gutterView.needsDisplay = true
+        scheduleViewportHighlight(debounceMs: 12)
+    }
+
     func syncWithTab(_ tab: EditorTab?) {
         guard let tab else {
             currentTabID = nil
+            currentTabURL = nil
             currentReloadRevision = 0
             return
         }
@@ -423,6 +612,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
         if tabChanged {
             currentTabID = tab.id
+            currentTabURL = tab.url
             currentReloadRevision = tab.externalReloadRevision
             currentLanguage = tab.language
             isProgrammaticUpdate = true
@@ -449,14 +639,18 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
             isProgrammaticUpdate = false
             dismissCompletion()
+            dismissHover()
             refreshDiagnosticsOverlay()
             applyOverlayAttributes()
             updateGutterWidthIfNeeded()
             gutterView.needsDisplay = true
             updateCursorStatus()
             scheduleViewportHighlight(debounceMs: 0)
-            focusEditor()
+            if workspace?.focusedEditorPane == pane || workspace?.isSplitEditorActive != true {
+                focusEditor()
+            }
         } else {
+            currentTabURL = tab.url
             if languageChanged {
                 currentLanguage = tab.language
                 textView.currentLanguage = tab.language
@@ -465,7 +659,9 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             if let pendingLine = tab.pendingJumpLine {
                 jumpToLine(pendingLine, column: tab.pendingJumpColumn)
                 workspace?.clearPendingJump(for: tab.id)
-                focusEditor()
+                if workspace?.focusedEditorPane == pane || workspace?.isSplitEditorActive != true {
+                    focusEditor()
+                }
             }
         }
     }
@@ -513,7 +709,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
     nonisolated func textView(_ textView: TextView, didReplaceContentsIn range: NSRange, with string: String) {
         MainActor.assumeIsolated {
             guard !isProgrammaticUpdate else { return }
-            workspace?.updateActiveTabContent(textView.string)
+            if let tabID = currentTabID {
+                workspace?.updateTabContent(tabID: tabID, newContent: textView.string, sourcePane: pane)
+            } else {
+                workspace?.updateActiveTabContent(textView.string)
+            }
             gutterView.needsDisplay = true
             scheduleViewportHighlight(debounceMs: 18)
             pendingCompletionInsertedString = string
@@ -529,10 +729,18 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
             let lineNum = linePos.index + 1
             let colNum = max(1, offset - linePos.range.location + 1)
             gutterView.activeLineIndex = linePos.index
-            workspace?.updateActiveTabCursor(line: lineNum, column: colNum, range: sel)
+            if let tabID = currentTabID {
+                workspace?.updateTabCursor(tabID: tabID, line: lineNum, column: colNum, range: sel, pane: pane)
+            } else {
+                workspace?.updateActiveTabCursor(line: lineNum, column: colNum, range: sel)
+            }
         } else {
             gutterView.activeLineIndex = 0
-            workspace?.updateActiveTabCursor(line: 1, column: 1, range: sel)
+            if let tabID = currentTabID {
+                workspace?.updateTabCursor(tabID: tabID, line: 1, column: 1, range: sel, pane: pane)
+            } else {
+                workspace?.updateActiveTabCursor(line: 1, column: 1, range: sel)
+            }
         }
     }
 
@@ -616,7 +824,8 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
     func refreshDiagnosticsOverlay() {
         var map: [Int: LSPDiagnosticSeverity] = [:]
-        for diag in workspace?.diagnosticsForActiveTab ?? [] {
+        let diags = workspace?.diagnostics(for: displayedTab) ?? []
+        for diag in diags {
             let line = diag.range.start.line
             if let existing = map[line] {
                 if diag.severity.rawValue < existing.rawValue {
@@ -633,7 +842,11 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
     private func updateFindEmphases() {
         guard let emphasisManager = textView.emphasisManager else { return }
-        guard let findState = workspace?.findState, findState.isFindBarVisible, !findState.matches.isEmpty else {
+        let isTargetPane = (workspace?.isSplitEditorActive != true) || (workspace?.focusedEditorPane == pane)
+        guard isTargetPane,
+              let findState = workspace?.findState,
+              findState.isFindBarVisible,
+              !findState.matches.isEmpty else {
             emphasisManager.removeEmphases(for: "find-matches")
             return
         }
@@ -668,7 +881,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 
     private func updateDiagnosticEmphases() {
         guard let emphasisManager = textView.emphasisManager else { return }
-        let diags = workspace?.diagnosticsForActiveTab ?? []
+        let diags = workspace?.diagnostics(for: displayedTab) ?? []
         guard !diags.isEmpty else {
             emphasisManager.removeEmphases(for: "lsp-diagnostics")
             return
@@ -910,15 +1123,110 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         let newLoc = min(storage.length, range.location + (item.insertText as NSString).length)
         textView.selectionManager.setSelectedRange(NSRange(location: newLoc, length: 0))
         isProgrammaticUpdate = false
-        workspace?.updateActiveTabContent(textView.string)
+        if let tabID = currentTabID {
+            workspace?.updateTabContent(tabID: tabID, newContent: textView.string, sourcePane: pane)
+        } else {
+            workspace?.updateActiveTabContent(textView.string)
+        }
         gutterView.needsDisplay = true
         scheduleViewportHighlight(debounceMs: 0)
         focusEditor()
     }
 
+    // MARK: - LSP Hover, Definition & References
+
+    private func scheduleHover(atOffset offset: Int, delayMs: UInt64 = 420) {
+        hoverTask?.cancel()
+        hoverRevision &+= 1
+        let rev = hoverRevision
+        lastHoverOffset = offset
+
+        guard let workspace,
+              let tab = displayedTab,
+              let fileURL = tab.url,
+              let pos = lspPosition(for: offset) else {
+            dismissHover()
+            return
+        }
+
+        let content = tab.content
+        let language = tab.language
+        let root = workspace.rootURL
+
+        hoverTask = Task { [weak self] in
+            if delayMs > 0 {
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            guard !Task.isCancelled else { return }
+
+            let hover = await LSPManager.shared.requestHover(
+                url: fileURL,
+                language: language,
+                content: content,
+                line: pos.line,
+                character: pos.character,
+                workspaceRoot: root
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.hoverRevision == rev else { return }
+                if let hover, !hover.contents.isEmpty {
+                    self.showHoverPopup(text: hover.contents, anchorOffset: offset)
+                } else {
+                    self.dismissHover()
+                }
+            }
+        }
+    }
+
+    func showHoverAtCursor() {
+        let offset = textView.selectionManager.textSelections.first?.range.location ?? 0
+        scheduleHover(atOffset: offset, delayMs: 0)
+    }
+
+    private func showHoverPopup(text: String, anchorOffset: Int) {
+        guard let hosting = hoverHostingView else { return }
+        hoverState.show(text)
+
+        textView.layoutManager.layoutLines()
+        let anchorRect: NSRect
+        if let r = textView.layoutManager.rectForOffset(anchorOffset) {
+            anchorRect = r
+        } else if let linePos = textView.layoutManager.textLineForOffset(anchorOffset) {
+            anchorRect = NSRect(x: textView.edgeInsets.left, y: linePos.yPos, width: 2, height: max(18, linePos.height))
+        } else {
+            anchorRect = NSRect(x: textView.edgeInsets.left, y: scrollView.documentVisibleRect.origin.y + 12, width: 2, height: 18)
+        }
+
+        let bottomPoint = textView.convert(NSPoint(x: anchorRect.minX, y: anchorRect.maxY), to: self)
+        let topPoint = textView.convert(NSPoint(x: anchorRect.minX, y: anchorRect.minY), to: self)
+
+        let lineCount = max(1, text.components(separatedBy: "\n").count)
+        let popupWidth: CGFloat = min(440, max(240, bounds.width - 32))
+        let popupHeight: CGFloat = min(210, max(44, CGFloat(lineCount) * 16.5 + 24))
+
+        let x = max(8, min(bottomPoint.x, max(8, bounds.width - popupWidth - 8)))
+        var y = topPoint.y + 6
+        if y + popupHeight > bounds.height - 8 {
+            y = bottomPoint.y - popupHeight - 6
+        }
+        y = max(8, min(y, max(8, bounds.height - popupHeight - 8)))
+
+        hosting.frame = NSRect(x: x, y: y, width: popupWidth, height: popupHeight)
+        hosting.isHidden = false
+        hosting.needsLayout = true
+        hosting.layoutSubtreeIfNeeded()
+    }
+
+    func dismissHover() {
+        hoverTask?.cancel()
+        hoverState.dismiss()
+        hoverHostingView?.isHidden = true
+    }
+
     func goToDefinition(atOffset offset: Int) {
         guard let workspace,
-              let tab = workspace.activeTab,
+              let tab = displayedTab ?? workspace.focusedTab,
               let fileURL = tab.url,
               let pos = lspPosition(for: offset) else {
             return
@@ -926,6 +1234,7 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
         let content = tab.content
         let language = tab.language
         let root = workspace.rootURL
+        let targetPane = pane
 
         Task { [weak workspace] in
             let locations = await LSPManager.shared.requestDefinition(
@@ -945,10 +1254,24 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
                 workspace.openFile(
                     url: targetURL.standardized,
                     atLine: first.range.start.line + 1,
-                    atColumn: first.range.start.character + 1
+                    atColumn: first.range.start.character + 1,
+                    recordHistory: true,
+                    targetPane: targetPane
                 )
             }
         }
+    }
+
+    func findReferences(atOffset offset: Int) {
+        guard let workspace,
+              let tab = displayedTab ?? workspace.focusedTab,
+              let pos = lspPosition(for: offset) else {
+            return
+        }
+        let nsText = textView.textStorage.string as NSString
+        let prefixRange = LocalCompletionProvider.identifierPrefixRange(in: nsText, at: min(offset + 1, nsText.length))
+        let symbolName = prefixRange.length > 0 ? nsText.substring(with: prefixRange) : ""
+        workspace.findReferences(for: tab, line: pos.line, character: pos.character, symbolName: symbolName)
     }
 }
 
@@ -957,55 +1280,90 @@ final class HighPerformanceEditorContainerView: NSView, TextViewDelegate {
 struct HighPerformanceEditorRepresentable: NSViewRepresentable {
     @ObservedObject var workspace: WorkspaceState
     let activeTab: EditorTab?
+    var pane: EditorPane = .primary
 
     func makeNSView(context: Context) -> HighPerformanceEditorContainerView {
-        let view = HighPerformanceEditorContainerView(workspace: workspace)
+        let view = HighPerformanceEditorContainerView(workspace: workspace, pane: pane)
         bindCallbacks(to: view)
         view.syncWithTab(activeTab)
         return view
     }
 
     func updateNSView(_ nsView: HighPerformanceEditorContainerView, context: Context) {
+        bindCallbacks(to: nsView)
         nsView.syncWithTab(activeTab)
     }
 
     static func dismantleNSView(_ nsView: HighPerformanceEditorContainerView, coordinator: ()) {
+        nsView.workspace?.unregisterEditorHandlers(for: nsView.pane)
         nsView.teardown()
     }
 
     private func bindCallbacks(to view: HighPerformanceEditorContainerView) {
-        workspace.onToggleCommentRequested = { [weak view] in
-            view?.textView.toggleComment()
-        }
-        workspace.onJumpToLocationRequested = { [weak view] line, column in
-            view?.jumpToLine(line, column: column)
-        }
-        workspace.onFocusEditorRequested = { [weak view] in
-            view?.focusEditor()
-        }
-        workspace.onRequestCompletionAction = { [weak view] in
-            view?.triggerCompletion(forceShow: true)
-        }
-        workspace.onGoToDefinitionAction = { [weak view] in
-            guard let view else { return }
-            let offset = view.textView.selectionManager.textSelections.first?.range.location ?? 0
-            view.goToDefinition(atOffset: offset)
-        }
-        workspace.onFindMatchesChanged = { [weak view] in
-            view?.applyOverlayAttributes()
-        }
-        workspace.onHighlightRangeRequested = { [weak view] range in
-            view?.highlightAndScroll(to: range)
-        }
-        workspace.onReplaceTextInActiveEditor = { [weak view] range, replacement in
-            view?.replaceRange(range, with: replacement)
-        }
-        workspace.onReplaceAllTextInActiveEditor = { [weak view] newText in
-            view?.replaceEntireDocument(with: newText)
-        }
-        workspace.onDiagnosticsUpdated = { [weak view] in
-            view?.refreshDiagnosticsOverlay()
-        }
+        let handlers = EditorPaneHandlers(
+            toggleComment: { [weak view] in
+                view?.textView.toggleComment()
+            },
+            jumpToLocation: { [weak view] line, column in
+                view?.jumpToLine(line, column: column)
+            },
+            focusEditor: { [weak view] in
+                view?.focusEditor()
+            },
+            requestCompletion: { [weak view] in
+                view?.triggerCompletion(forceShow: true)
+            },
+            goToDefinition: { [weak view] in
+                guard let view else { return }
+                let offset = view.textView.selectionManager.textSelections.first?.range.location ?? 0
+                view.goToDefinition(atOffset: offset)
+            },
+            findReferences: { [weak view] in
+                guard let view else { return }
+                let offset = view.textView.selectionManager.textSelections.first?.range.location ?? 0
+                view.findReferences(atOffset: offset)
+            },
+            showHover: { [weak view] in
+                view?.showHoverAtCursor()
+            },
+            formatDocument: { [weak workspace] in
+                workspace?.formatActiveDocument()
+            },
+            findMatchesChanged: { [weak view] in
+                view?.applyOverlayAttributes()
+            },
+            highlightRange: { [weak view] range in
+                view?.highlightAndScroll(to: range)
+            },
+            replaceText: { [weak view] range, replacement in
+                view?.replaceRange(range, with: replacement)
+            },
+            replaceAllText: { [weak view] newText in
+                view?.replaceEntireDocument(with: newText)
+            },
+            diagnosticsUpdated: { [weak view] in
+                view?.refreshDiagnosticsOverlay()
+            },
+            selectNextOccurrence: { [weak view] in
+                view?.textView.selectNextOccurrence()
+            },
+            moveLines: { [weak view] up in
+                view?.textView.moveSelectedLines(up: up)
+            },
+            duplicateLines: { [weak view] up in
+                view?.textView.duplicateSelectedLines(up: up)
+            },
+            deleteLines: { [weak view] in
+                view?.textView.deleteSelectedLines()
+            },
+            insertLine: { [weak view] above in
+                view?.textView.insertLine(above: above)
+            },
+            syncBufferExternally: { [weak view] tabID, newText in
+                view?.syncExternalBufferChange(tabID: tabID, newContent: newText)
+            }
+        )
+        workspace.registerEditorHandlers(handlers, for: pane)
     }
 
     func sizeThatFits(

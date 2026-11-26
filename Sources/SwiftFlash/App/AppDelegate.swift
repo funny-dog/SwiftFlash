@@ -1,16 +1,161 @@
 import AppKit
 import Combine
 
+// MARK: - Per-Window IDE Controller (Multi-Window Support)
+
+@MainActor
+final class IDEWindowController: NSObject, NSWindowDelegate {
+    let window: NSWindow
+    let workspace: WorkspaceState
+    let rootController: RootIDEViewController
+
+    private var titleCancellable: AnyCancellable?
+    private var themeCancellable: AnyCancellable?
+    var onDidClose: ((IDEWindowController) -> Void)?
+
+    init(
+        workspace: WorkspaceState,
+        cascadeFrom previousWindow: NSWindow? = nil
+    ) {
+        self.workspace = workspace
+        self.rootController = RootIDEViewController(workspace: workspace)
+
+        let initialRect = Self.resolveInitialWindowRect(cascadeFrom: previousWindow)
+        self.window = NSWindow(
+            contentRect: initialRect,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+
+        window.delegate = self
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = false
+        window.backgroundColor = ZedTheme.background
+        window.minSize = NSSize(width: 820, height: 520)
+        window.contentViewController = rootController
+        updateWindowTitle()
+
+        titleCancellable = workspace.$rootURL
+            .combineLatest(workspace.$activeTabID, workspace.$openTabs, workspace.$hasWorkspaceOpen)
+            .sink { [weak self] _ in
+                self?.updateWindowTitle()
+            }
+
+        themeCancellable = ThemeManager.shared.$currentThemeID
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.window.backgroundColor = ZedTheme.background
+            }
+    }
+
+    private static func resolveInitialWindowRect(cascadeFrom previousWindow: NSWindow?) -> NSRect {
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        if let prev = previousWindow {
+            let offset: CGFloat = 28
+            var rect = prev.frame
+            rect.origin.x = min(screenFrame.maxX - rect.width, rect.origin.x + offset)
+            rect.origin.y = max(screenFrame.minY, rect.origin.y - offset)
+            return rect
+        }
+
+        if let saved = SessionPersistence.loadWindowFrame(),
+           saved.width >= 820,
+           saved.height >= 520 {
+            let candidate = NSRect(x: saved.x, y: saved.y, width: saved.width, height: saved.height)
+            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(candidate) }) {
+                return candidate
+            }
+        }
+
+        let width = min(1360, screenFrame.width * 0.88)
+        let height = min(860, screenFrame.height * 0.88)
+        let originX = screenFrame.midX - width / 2
+        let originY = screenFrame.midY - height / 2
+        return NSRect(x: originX, y: originY, width: width, height: height)
+    }
+
+    func show() {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func updateWindowTitle() {
+        let tab = workspace.focusedTab ?? workspace.activeTab
+        guard workspace.hasWorkspaceOpen else {
+            if let tab {
+                let dirtyMark = tab.isDirty ? " •" : ""
+                window.title = "\(tab.title)\(dirtyMark) — SwiftFlash"
+            } else {
+                window.title = "SwiftFlash"
+            }
+            return
+        }
+        let folderName = workspace.rootURL.lastPathComponent
+        if let tab {
+            let dirtyMark = tab.isDirty ? " •" : ""
+            window.title = "\(tab.title)\(dirtyMark) — \(folderName) (SwiftFlash)"
+        } else {
+            window.title = "\(folderName) — SwiftFlash"
+        }
+    }
+
+    func persistWindowGeometry() {
+        let f = window.frame
+        SessionPersistence.saveWindowFrame(
+            PersistedWindowFrame(x: f.origin.x, y: f.origin.y, width: f.width, height: f.height)
+        )
+    }
+
+    func shutdownWindowResources() {
+        persistWindowGeometry()
+        rootController.mainSplitController.shutdownTerminal()
+        workspace.teardownResources()
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        workspace.confirmTerminationWithUnsavedChanges()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        shutdownWindowResources()
+        onDidClose?(self)
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        persistWindowGeometry()
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        persistWindowGeometry()
+    }
+}
+
+// MARK: - AppDelegate
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: NSWindow!
-    private var workspace: WorkspaceState!
-    private var rootController: RootIDEViewController!
-    private var titleCancellable: AnyCancellable?
+    private var windowControllers: [IDEWindowController] = []
     private var themeCancellable: AnyCancellable?
     private var systemAppearanceObserver: NSObjectProtocol?
     private var pendingOpenURLs: [URL] = []
     private var hasFinishedLaunching = false
+
+    private var activeController: IDEWindowController? {
+        if let keyWin = NSApp.keyWindow,
+           let matched = windowControllers.first(where: { $0.window === keyWin }) {
+            return matched
+        }
+        return windowControllers.last
+    }
+
+    private var activeWorkspace: WorkspaceState? {
+        activeController?.workspace
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = LocalizationManager.shared
@@ -54,36 +199,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             remainingURLs.append(url)
         }
 
-        workspace = WorkspaceState(initialURL: initialFolder)
-        rootController = RootIDEViewController(workspace: workspace)
-
         buildMainMenu()
 
-        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let width = min(1360, screenFrame.width * 0.88)
-        let height = min(860, screenFrame.height * 0.88)
-        let originX = screenFrame.midX - width / 2
-        let originY = screenFrame.midY - height / 2
-
-        window = NSWindow(
-            contentRect: NSRect(x: originX, y: originY, width: width, height: height),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = false
-        window.backgroundColor = ZedTheme.background
-        window.minSize = NSSize(width: 820, height: 520)
-        window.contentViewController = rootController
-        updateWindowTitle()
-
-        titleCancellable = workspace.$rootURL
-            .combineLatest(workspace.$activeTabID, workspace.$openTabs, workspace.$hasWorkspaceOpen)
-            .sink { [weak self] _ in
-                self?.updateWindowTitle()
-            }
+        let mainController = createWindow(initialURL: initialFolder, restoreLastProjectIfNil: true)
 
         themeCancellable = ThemeManager.shared.$currentThemeID
             .receive(on: DispatchQueue.main)
@@ -91,36 +209,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.applyAppThemeAppearance()
             }
 
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         hasFinishedLaunching = true
 
         // Register extra directories into window switcher without re-reloading `initialFolder`.
         for extraDir in extraDirectories {
-            if !workspace.windowProjects.contains(where: { $0.standardized.path == extraDir.path }) {
-                workspace.windowProjects.append(extraDir)
+            if !mainController.workspace.windowProjects.contains(where: { $0.standardized.path == extraDir.path }) {
+                mainController.workspace.windowProjects.append(extraDir)
             }
-            workspace.recordRecentProject(extraDir)
+            mainController.workspace.recordRecentProject(extraDir)
         }
         if !remainingURLs.isEmpty {
-            workspace.openExternalURLs(remainingURLs)
+            mainController.workspace.openExternalURLs(remainingURLs)
         }
     }
 
+    @discardableResult
+    func createWindow(initialURL: URL?, restoreLastProjectIfNil: Bool) -> IDEWindowController {
+        let ws = WorkspaceState(
+            initialURL: initialURL,
+            userDefaults: .standard,
+            restoreLastProjectIfNil: restoreLastProjectIfNil
+        )
+        ws.onNewWindowRequested = { [weak self] in
+            self?.newWindowAction(nil)
+        }
+        ws.onOpenFolderInNewWindowRequested = { [weak self] in
+            self?.openFolderInNewWindowAction(nil)
+        }
+
+        let controller = IDEWindowController(workspace: ws, cascadeFrom: activeController?.window)
+        controller.onDidClose = { [weak self] closed in
+            self?.windowControllers.removeAll { $0 === closed }
+        }
+        windowControllers.append(controller)
+        controller.show()
+        return controller
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard hasFinishedLaunching, workspace != nil else {
+        guard hasFinishedLaunching, let controller = activeController else {
             pendingOpenURLs.append(contentsOf: urls)
             return
         }
-        workspace.openExternalURLs(urls)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        controller.workspace.openExternalURLs(urls)
+        controller.show()
     }
 
     private func applyAppThemeAppearance() {
         let isDark = ThemeManager.shared.palette.isDark
         NSApp.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
-        window?.backgroundColor = ZedTheme.background
+        for controller in windowControllers {
+            controller.window.backgroundColor = ZedTheme.background
+        }
     }
 
     private func applySystemAppIcon() {
@@ -145,8 +285,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let workspace else { return .terminateNow }
-        return workspace.confirmTerminationWithUnsavedChanges() ? .terminateNow : .terminateCancel
+        for controller in windowControllers {
+            if !controller.workspace.confirmTerminationWithUnsavedChanges() {
+                return .terminateCancel
+            }
+        }
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -154,8 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DistributedNotificationCenter.default().removeObserver(systemAppearanceObserver)
             self.systemAppearanceObserver = nil
         }
-        rootController?.mainSplitController.shutdownTerminal()
-        workspace?.stopRunningTask()
+        for controller in windowControllers {
+            controller.shutdownWindowResources()
+        }
         LSPManager.shared.shutdownAll()
     }
 
@@ -186,61 +331,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return urls
     }
 
-    private func updateWindowTitle() {
-        guard workspace.hasWorkspaceOpen else {
-            if let tab = workspace.activeTab {
-                let dirtyMark = tab.isDirty ? " •" : ""
-                window.title = "\(tab.title)\(dirtyMark) — SwiftFlash"
-            } else {
-                window.title = "SwiftFlash"
-            }
-            return
-        }
-        let folderName = workspace.rootURL.lastPathComponent
-        if let tab = workspace.activeTab {
-            let dirtyMark = tab.isDirty ? " •" : ""
-            window.title = "\(tab.title)\(dirtyMark) — \(folderName) (SwiftFlash)"
-        } else {
-            window.title = "\(folderName) — SwiftFlash"
+    // MARK: - Menu Actions
+
+    @objc private func newWindowAction(_ sender: Any?) {
+        createWindow(initialURL: nil, restoreLastProjectIfNil: false)
+    }
+
+    @objc private func openFolderInNewWindowAction(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = L10n("dialog.openFolder.prompt")
+        panel.message = L10n("dialog.openFolder.message")
+        if panel.runModal() == .OK, let url = panel.url {
+            createWindow(initialURL: url, restoreLastProjectIfNil: false)
         }
     }
 
-    // MARK: - Menu Actions
-
     @objc private func openFolderAction(_ sender: Any?) {
-        workspace.openFolderPanel()
+        activeWorkspace?.openFolderPanel()
     }
 
     @objc private func newFileAction(_ sender: Any?) {
-        workspace.createNewUntitledFile()
+        activeWorkspace?.createNewUntitledFile()
     }
 
     @objc private func saveFileAction(_ sender: Any?) {
-        workspace.saveActiveTab()
+        activeWorkspace?.saveActiveTabWithOptionalFormatting()
     }
 
     @objc private func closeTabAction(_ sender: Any?) {
-        workspace.closeActiveTab()
+        activeWorkspace?.closeActiveTab()
     }
 
     @objc private func quickOpenAction(_ sender: Any?) {
-        workspace.toggleOverlay(.quickOpen)
+        activeWorkspace?.toggleOverlay(.quickOpen)
+    }
+
+    @objc private func commandPaletteAction(_ sender: Any?) {
+        activeWorkspace?.toggleOverlay(.commandPalette)
+    }
+
+    @objc private func symbolOutlineAction(_ sender: Any?) {
+        activeWorkspace?.toggleOverlay(.symbolOutline)
     }
 
     @objc private func switchProjectAction(_ sender: Any?) {
-        workspace.toggleOverlay(.projectSwitcher)
+        activeWorkspace?.toggleOverlay(.projectSwitcher)
     }
 
     @objc private func switchWorktreeAction(_ sender: Any?) {
-        workspace.toggleOverlay(.worktreeSwitcher)
+        activeWorkspace?.toggleOverlay(.worktreeSwitcher)
     }
 
     @objc private func switchBranchAction(_ sender: Any?) {
-        workspace.toggleOverlay(.branchSwitcher)
+        activeWorkspace?.toggleOverlay(.branchSwitcher)
     }
 
     @objc private func openSettingsAction(_ sender: Any?) {
-        workspace.toggleOverlay(.settings)
+        activeWorkspace?.toggleOverlay(.settings)
     }
 
     @objc private func zoomInAction(_ sender: Any?) {
@@ -256,72 +406,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func globalSearchAction(_ sender: Any?) {
-        rootController.mainSplitController.ensureSidebarVisible(mode: .search)
-        workspace.searchFocusNonce &+= 1
+        activeController?.rootController.mainSplitController.ensureSidebarVisible(mode: .search)
+        activeWorkspace?.searchFocusNonce &+= 1
     }
 
     @objc private func toggleGitPanelAction(_ sender: Any?) {
-        rootController.mainSplitController.selectOrToggleSidebar(mode: .git)
+        activeController?.rootController.mainSplitController.selectOrToggleSidebar(mode: .git)
     }
 
     @objc private func viewGitDiffAction(_ sender: Any?) {
-        workspace.openGitDiffInEditor()
+        activeWorkspace?.openGitDiffInEditor()
     }
 
     @objc private func toggleSidebarAction(_ sender: Any?) {
-        rootController.mainSplitController.toggleSidebar()
+        activeController?.rootController.mainSplitController.toggleSidebar()
+    }
+
+    @objc private func toggleSplitEditorAction(_ sender: Any?) {
+        activeWorkspace?.toggleSplitEditor()
     }
 
     @objc private func toggleTerminalAction(_ sender: Any?) {
-        rootController.mainSplitController.toggleTerminal()
+        activeController?.rootController.mainSplitController.toggleTerminal()
+    }
+
+    @objc private func newTerminalTabAction(_ sender: Any?) {
+        activeWorkspace?.onNewTerminalTabAction?()
     }
 
     @objc private func toggleCommentAction(_ sender: Any?) {
-        workspace.onToggleCommentRequested?()
+        activeWorkspace?.onToggleCommentRequested?()
+    }
+
+    @objc private func selectNextOccurrenceAction(_ sender: Any?) {
+        activeWorkspace?.onSelectNextOccurrenceAction?()
+    }
+
+    @objc private func deleteLineAction(_ sender: Any?) {
+        activeWorkspace?.onDeleteLinesAction?()
+    }
+
+    @objc private func formatDocumentAction(_ sender: Any?) {
+        activeWorkspace?.formatActiveDocument()
     }
 
     @objc private func findAction(_ sender: Any?) {
-        workspace.presentFindBar(replace: false)
+        activeWorkspace?.presentFindBar(replace: false)
     }
 
     @objc private func findReplaceAction(_ sender: Any?) {
-        workspace.presentFindBar(replace: true)
+        activeWorkspace?.presentFindBar(replace: true)
     }
 
     @objc private func findNextAction(_ sender: Any?) {
-        workspace.findNextInActiveFile()
+        activeWorkspace?.findNextInActiveFile()
     }
 
     @objc private func findPreviousAction(_ sender: Any?) {
-        workspace.findPreviousInActiveFile()
+        activeWorkspace?.findPreviousInActiveFile()
     }
 
     @objc private func goToLineAction(_ sender: Any?) {
-        workspace.presentGoToLine()
+        activeWorkspace?.presentGoToLine()
+    }
+
+    @objc private func navigateBackAction(_ sender: Any?) {
+        activeWorkspace?.navigateBack()
+    }
+
+    @objc private func navigateForwardAction(_ sender: Any?) {
+        activeWorkspace?.navigateForward()
+    }
+
+    @objc private func previousTabAction(_ sender: Any?) {
+        activeWorkspace?.selectAdjacentTab(delta: -1)
+    }
+
+    @objc private func nextTabAction(_ sender: Any?) {
+        activeWorkspace?.selectAdjacentTab(delta: 1)
+    }
+
+    @objc private func selectTabNumberAction(_ sender: NSMenuItem) {
+        activeWorkspace?.selectTabAtIndex(sender.tag)
     }
 
     @objc private func triggerCompletionAction(_ sender: Any?) {
-        workspace.onRequestCompletionAction?()
+        activeWorkspace?.onRequestCompletionAction?()
+    }
+
+    @objc private func showHoverAction(_ sender: Any?) {
+        activeWorkspace?.onShowHoverAction?()
     }
 
     @objc private func goToDefinitionAction(_ sender: Any?) {
-        workspace.onGoToDefinitionAction?()
+        activeWorkspace?.onGoToDefinitionAction?()
+    }
+
+    @objc private func findReferencesAction(_ sender: Any?) {
+        activeWorkspace?.onFindReferencesAction?()
     }
 
     @objc private func runProjectAction(_ sender: Any?) {
-        workspace.runDefaultRunTask()
+        activeWorkspace?.runDefaultRunTask()
     }
 
     @objc private func testProjectAction(_ sender: Any?) {
-        workspace.runDefaultTestTask()
+        activeWorkspace?.runDefaultTestTask()
     }
 
     @objc private func stopTaskAction(_ sender: Any?) {
-        workspace.stopRunningTask()
+        activeWorkspace?.stopRunningTask()
     }
 
     @objc private func showProblemsAction(_ sender: Any?) {
-        workspace.showBottomPanel(.problems)
+        activeWorkspace?.showBottomPanel(.problems)
+    }
+
+    @objc private func showReferencesAction(_ sender: Any?) {
+        activeWorkspace?.showBottomPanel(.references)
     }
 
     // MARK: - Main Menu Bar Construction
@@ -347,8 +549,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileMenu = NSMenu(title: L10n("menu.file"))
         fileMenuItem.submenu = fileMenu
         fileMenu.addItem(makeItem(L10n("menu.file.new"), action: #selector(newFileAction(_:)), key: "n"))
+        fileMenu.addItem(makeItem(L10n("menu.file.newWindow"), action: #selector(newWindowAction(_:)), key: "N"))
         fileMenu.addItem(makeItem(L10n("menu.file.openFolder"), action: #selector(openFolderAction(_:)), key: "o"))
-        fileMenu.addItem(makeItem(L10n("menu.file.switchProject"), action: #selector(switchProjectAction(_:)), key: "O"))
+        fileMenu.addItem(NSMenuItem(title: L10n("menu.file.openFolderNewWindow"), action: #selector(openFolderInNewWindowAction(_:)), keyEquivalent: ""))
+        let switchProjItem = NSMenuItem(title: L10n("menu.file.switchProject"), action: #selector(switchProjectAction(_:)), keyEquivalent: "o")
+        switchProjItem.keyEquivalentModifierMask = [.control, .command]
+        fileMenu.addItem(switchProjItem)
         fileMenu.addItem(NSMenuItem.separator())
         fileMenu.addItem(makeItem(L10n("menu.file.save"), action: #selector(saveFileAction(_:)), key: "s"))
         fileMenu.addItem(makeItem(L10n("menu.file.closeTab"), action: #selector(closeTabAction(_:)), key: "w"))
@@ -367,26 +573,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(makeItem(L10n("menu.edit.selectAll"), action: #selector(NSText.selectAll(_:)), key: "a"))
         editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(makeItem(L10n("menu.edit.toggleComment"), action: #selector(toggleCommentAction(_:)), key: "/"))
+        editMenu.addItem(makeItem(L10n("menu.edit.selectNextOccurrence"), action: #selector(selectNextOccurrenceAction(_:)), key: "d"))
+        editMenu.addItem(makeItem(L10n("menu.edit.deleteLine"), action: #selector(deleteLineAction(_:)), key: "K"))
+        let formatItem = NSMenuItem(title: L10n("menu.edit.formatDocument"), action: #selector(formatDocumentAction(_:)), keyEquivalent: "f")
+        formatItem.keyEquivalentModifierMask = [.option, .shift]
+        editMenu.addItem(formatItem)
+        editMenu.addItem(NSMenuItem.separator())
         editMenu.addItem(makeItem(L10n("menu.edit.find"), action: #selector(findAction(_:)), key: "f"))
         let findReplaceItem = NSMenuItem(title: L10n("menu.edit.findReplace"), action: #selector(findReplaceAction(_:)), keyEquivalent: "f")
         findReplaceItem.keyEquivalentModifierMask = [.option, .command]
         editMenu.addItem(findReplaceItem)
         editMenu.addItem(makeItem(L10n("menu.edit.findNext"), action: #selector(findNextAction(_:)), key: "g"))
         editMenu.addItem(makeItem(L10n("menu.edit.findPrevious"), action: #selector(findPreviousAction(_:)), key: "G"))
-        editMenu.addItem(makeItem(L10n("menu.edit.goToLine"), action: #selector(goToLineAction(_:)), key: "l"))
         editMenu.addItem(makeItem(L10n("menu.edit.findInWorkspace"), action: #selector(globalSearchAction(_:)), key: "F"))
         editMenu.addItem(NSMenuItem.separator())
         let completionItem = NSMenuItem(title: L10n("menu.edit.triggerCompletion"), action: #selector(triggerCompletionAction(_:)), keyEquivalent: " ")
         completionItem.keyEquivalentModifierMask = [.control]
         editMenu.addItem(completionItem)
+        editMenu.addItem(makeItem(L10n("menu.edit.showHover"), action: #selector(showHoverAction(_:)), key: "k"))
         editMenu.addItem(NSMenuItem(title: L10n("menu.edit.goToDefinition"), action: #selector(goToDefinitionAction(_:)), keyEquivalent: ""))
+        editMenu.addItem(NSMenuItem(title: L10n("menu.edit.findReferences"), action: #selector(findReferencesAction(_:)), keyEquivalent: ""))
+
+        // Go Menu
+        let goMenuItem = NSMenuItem()
+        mainMenu.addItem(goMenuItem)
+        let goMenu = NSMenu(title: L10n("menu.go"))
+        goMenuItem.submenu = goMenu
+        let backItem = NSMenuItem(title: L10n("menu.go.back"), action: #selector(navigateBackAction(_:)), keyEquivalent: "-")
+        backItem.keyEquivalentModifierMask = [.control]
+        goMenu.addItem(backItem)
+        let fwdItem = NSMenuItem(title: L10n("menu.go.forward"), action: #selector(navigateForwardAction(_:)), keyEquivalent: "-")
+        fwdItem.keyEquivalentModifierMask = [.control, .shift]
+        goMenu.addItem(fwdItem)
+        goMenu.addItem(NSMenuItem.separator())
+        goMenu.addItem(makeItem(L10n("menu.view.quickOpen"), action: #selector(quickOpenAction(_:)), key: "p"))
+        goMenu.addItem(makeItem(L10n("symbols.title"), action: #selector(symbolOutlineAction(_:)), key: "O"))
+        goMenu.addItem(makeItem(L10n("menu.edit.goToLine"), action: #selector(goToLineAction(_:)), key: "l"))
+        goMenu.addItem(NSMenuItem.separator())
+        let prevTabItem = NSMenuItem(title: L10n("menu.go.previousTab"), action: #selector(previousTabAction(_:)), keyEquivalent: "[")
+        prevTabItem.keyEquivalentModifierMask = [.command, .shift]
+        goMenu.addItem(prevTabItem)
+        let nextTabItem = NSMenuItem(title: L10n("menu.go.nextTab"), action: #selector(nextTabAction(_:)), keyEquivalent: "]")
+        nextTabItem.keyEquivalentModifierMask = [.command, .shift]
+        goMenu.addItem(nextTabItem)
+        for num in 1...9 {
+            let item = NSMenuItem(title: "Tab \(num)", action: #selector(selectTabNumberAction(_:)), keyEquivalent: "\(num)")
+            item.keyEquivalentModifierMask = [.command]
+            item.tag = num - 1
+            item.isHidden = true
+            goMenu.addItem(item)
+        }
 
         // View Menu
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
         let viewMenu = NSMenu(title: L10n("menu.view"))
         viewMenuItem.submenu = viewMenu
-        viewMenu.addItem(makeItem(L10n("menu.view.quickOpen"), action: #selector(quickOpenAction(_:)), key: "p"))
+        viewMenu.addItem(makeItem(L10n("commandPalette.title"), action: #selector(commandPaletteAction(_:)), key: "P"))
+        viewMenu.addItem(makeItem(L10n("menu.view.toggleSplitEditor"), action: #selector(toggleSplitEditorAction(_:)), key: "\\"))
+        viewMenu.addItem(NSMenuItem.separator())
         viewMenu.addItem(makeItem(L10n("menu.view.switchWorktree"), action: #selector(switchWorktreeAction(_:)), key: "W"))
         viewMenu.addItem(makeItem(L10n("menu.view.switchBranch"), action: #selector(switchBranchAction(_:)), key: "B"))
         viewMenu.addItem(NSMenuItem.separator())
@@ -402,7 +647,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewDiffItem.keyEquivalentModifierMask = [.control, .command]
         viewMenu.addItem(viewDiffItem)
         viewMenu.addItem(makeItem(L10n("menu.view.toggleTerminal"), action: #selector(toggleTerminalAction(_:)), key: "j"))
+        let newTermItem = NSMenuItem(title: L10n("terminal.newTab"), action: #selector(newTerminalTabAction(_:)), keyEquivalent: "`")
+        newTermItem.keyEquivalentModifierMask = [.control, .shift]
+        viewMenu.addItem(newTermItem)
         viewMenu.addItem(NSMenuItem(title: L10n("menu.view.showProblems"), action: #selector(showProblemsAction(_:)), keyEquivalent: ""))
+        viewMenu.addItem(NSMenuItem(title: L10n("menu.view.showReferences"), action: #selector(showReferencesAction(_:)), keyEquivalent: ""))
 
         // Run Menu
         let runMenuItem = NSMenuItem()
@@ -412,6 +661,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runMenu.addItem(makeItem(L10n("menu.run.run"), action: #selector(runProjectAction(_:)), key: "r"))
         runMenu.addItem(makeItem(L10n("menu.run.test"), action: #selector(testProjectAction(_:)), key: "u"))
         runMenu.addItem(makeItem(L10n("menu.run.stop"), action: #selector(stopTaskAction(_:)), key: "."))
+
+        // Window Menu
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenuItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        NSApp.windowsMenu = windowMenu
     }
 
     private func makeItem(_ title: String, action: Selector, key: String) -> NSMenuItem {

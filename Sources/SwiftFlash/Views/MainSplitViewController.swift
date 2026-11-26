@@ -20,12 +20,12 @@ final class WorkspaceOverlayContainerView<Content: View>: NSHostingView<Content>
 @MainActor
 final class EditorTerminalSplitController: NSSplitViewController {
     let workspace: WorkspaceState
-    let terminalSession: TerminalSession
+    let terminalManager: TerminalTabManager
     private var terminalSplitItem: NSSplitViewItem!
 
     init(workspace: WorkspaceState) {
         self.workspace = workspace
-        self.terminalSession = TerminalSession(workingDirectory: workspace.rootURL)
+        self.terminalManager = TerminalTabManager(workingDirectory: workspace.rootURL)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -47,7 +47,7 @@ final class EditorTerminalSplitController: NSSplitViewController {
         let terminalVC = NSHostingController(
             rootView: BottomPanelView(
                 workspace: workspace,
-                session: terminalSession,
+                terminalManager: terminalManager,
                 taskRunner: workspace.taskRunner
             )
         )
@@ -89,8 +89,13 @@ final class EditorTerminalSplitController: NSSplitViewController {
         }
     }
 
+    func createNewTerminalTab() {
+        showBottomPanel(tab: .terminal)
+        terminalManager.createTab(in: workspace.rootURL)
+    }
+
     func shutdownTerminal() {
-        terminalSession.terminateRunningCommand(appendNotice: false)
+        terminalManager.shutdownAll()
     }
 }
 
@@ -145,6 +150,9 @@ final class MainSplitViewController: NSSplitViewController {
         }
         workspace.onShowBottomPanelAction = { [weak self] tab in
             self?.rightSplitController.showBottomPanel(tab: tab)
+        }
+        workspace.onNewTerminalTabAction = { [weak self] in
+            self?.rightSplitController.createNewTerminalTab()
         }
     }
 

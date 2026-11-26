@@ -24,11 +24,13 @@ private struct TitlebarWindowDragArea: NSViewRepresentable {
 struct ZedTopHeaderBarView: View {
     @ObservedObject var workspace: WorkspaceState
     @ObservedObject private var taskRunner: TaskRunnerState
+    @ObservedObject private var navHistory: NavigationHistory
     @ObservedObject private var themeManager = ThemeManager.shared
 
     init(workspace: WorkspaceState) {
         self.workspace = workspace
         self.taskRunner = workspace.taskRunner
+        self.navHistory = workspace.navigationHistory
     }
 
     var body: some View {
@@ -41,6 +43,33 @@ struct ZedTopHeaderBarView: View {
                 // Reserve space for macOS traffic lights (close/minimize/zoom)
                 Color.clear
                     .frame(width: 72, height: 1)
+
+                // Back / Forward Navigation History
+                HStack(spacing: 2) {
+                    Button {
+                        workspace.navigateBack()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundColor(Color(nsColor: navHistory.canGoBack ? ZedTheme.secondaryText : ZedTheme.mutedText.withAlphaComponent(0.45)))
+                            .frame(width: 20, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!navHistory.canGoBack)
+                    .help(L10n("menu.go.back") + " (⌃-)")
+
+                    Button {
+                        workspace.navigateForward()
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundColor(Color(nsColor: navHistory.canGoForward ? ZedTheme.secondaryText : ZedTheme.mutedText.withAlphaComponent(0.45)))
+                            .frame(width: 20, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!navHistory.canGoForward)
+                    .help(L10n("menu.go.forward") + " (⌃⇧-)")
+                }
 
                 // Project Selector Pill
                 Button {
@@ -218,6 +247,15 @@ struct ZedTopHeaderBarView: View {
                 // Right Utility Controls
                 HStack(spacing: 6) {
                     headerIconButton(
+                        icon: "command",
+                        title: nil,
+                        isActive: workspace.activeOverlay == .commandPalette,
+                        helpText: L10n("commandPalette.help")
+                    ) {
+                        workspace.toggleOverlay(.commandPalette)
+                    }
+
+                    headerIconButton(
                         icon: "magnifyingglass",
                         title: "⌘P",
                         isActive: workspace.activeOverlay == .quickOpen,
@@ -318,6 +356,12 @@ struct WorkspaceOverlayHostView: View {
 
             case .quickOpen:
                 QuickOpenModalView(workspace: workspace)
+
+            case .commandPalette:
+                CommandPaletteModalView(workspace: workspace)
+
+            case .symbolOutline:
+                SymbolOutlineModalView(workspace: workspace)
 
             case .projectSwitcher:
                 dropdownHost(leadingPadding: 74, width: 340) {

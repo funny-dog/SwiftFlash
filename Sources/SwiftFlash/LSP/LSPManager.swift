@@ -42,6 +42,9 @@ final class LSPManager: ObservableObject {
     private var hasScannedInitialStatuses = false
     private var refreshTask: Task<Void, Never>?
 
+    static let diagnosticsDidUpdateNotification = Notification.Name("dev.swiftflash.lsp.diagnosticsDidUpdate")
+    static let serverBecameReadyNotification = Notification.Name("dev.swiftflash.lsp.serverBecameReady")
+
     var onDiagnosticsReceived: ((URL, [LSPDiagnostic]) -> Void)?
     var onServerBecameReady: (() -> Void)?
 
@@ -94,6 +97,7 @@ final class LSPManager: ObservableObject {
             let newlyReady = Set(updated.filter { $0.value.isReady }.keys).subtracting(previouslyReady)
             if !newlyReady.isEmpty {
                 self.onServerBecameReady?()
+                NotificationCenter.default.post(name: Self.serverBecameReadyNotification, object: self)
             }
         }
 
@@ -452,6 +456,120 @@ final class LSPManager: ObservableObject {
         return (try? await conn.definition(url: url, line: line, character: character)) ?? []
     }
 
+    func requestHover(
+        url: URL,
+        language: CodeLanguage,
+        content: String,
+        line: Int,
+        character: Int,
+        workspaceRoot: URL
+    ) async -> LSPHover? {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
+              let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
+            return nil
+        }
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
+        return try? await conn.hover(url: url, line: line, character: character)
+    }
+
+    func requestReferences(
+        url: URL,
+        language: CodeLanguage,
+        content: String,
+        line: Int,
+        character: Int,
+        workspaceRoot: URL
+    ) async -> [LSPLocation] {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
+              let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
+            return []
+        }
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
+        return (try? await conn.references(url: url, line: line, character: character)) ?? []
+    }
+
+    func requestFormatting(
+        url: URL,
+        language: CodeLanguage,
+        content: String,
+        workspaceRoot: URL,
+        tabSize: Int = 4,
+        insertSpaces: Bool = true
+    ) async -> [LSPTextEdit]? {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
+              let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
+            return nil
+        }
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
+        return try? await conn.formatting(url: url, tabSize: tabSize, insertSpaces: insertSpaces)
+    }
+
+    func requestDocumentSymbols(
+        url: URL,
+        language: CodeLanguage,
+        content: String,
+        workspaceRoot: URL
+    ) async -> [LSPDocumentSymbol] {
+        let dKey = documentKey(url: url)
+        latestDocumentContents[dKey] = content
+
+        await ensureStatusesScanned()
+        guard let def = serverDefinition(for: language, url: url),
+              let lspLangID = lspLanguageID(for: language, url: url),
+              let conn = await connection(for: def, workspaceRoot: workspaceRoot) else {
+            return []
+        }
+
+        let sKey = sessionKey(serverID: def.id, workspaceRoot: workspaceRoot)
+        flushPendingChange(
+            sessionKey: sKey,
+            url: url,
+            languageID: lspLangID,
+            content: latestDocumentContents[dKey] ?? content,
+            connection: conn
+        )
+        return (try? await conn.documentSymbols(url: url)) ?? []
+    }
+
     func shutdownAll() {
         for (_, task) in pendingChangeTasks {
             task.cancel()
@@ -568,8 +686,15 @@ final class LSPManager: ObservableObject {
                 )
                 conn.onDiagnostics = { [weak self] uriString, diagnostics in
                     guard let fileURL = URL(string: uriString) else { return }
+                    let stdURL = fileURL.standardized
                     Task { @MainActor [weak self] in
-                        self?.onDiagnosticsReceived?(fileURL.standardized, diagnostics)
+                        guard let self else { return }
+                        self.onDiagnosticsReceived?(stdURL, diagnostics)
+                        NotificationCenter.default.post(
+                            name: Self.diagnosticsDidUpdateNotification,
+                            object: self,
+                            userInfo: ["url": stdURL, "diagnostics": diagnostics]
+                        )
                     }
                 }
                 conn.onTerminated = { [weak self] in

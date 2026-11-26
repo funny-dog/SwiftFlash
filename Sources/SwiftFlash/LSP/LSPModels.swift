@@ -18,6 +18,103 @@ struct LSPLocation: Codable, Equatable, Hashable, Sendable {
     let range: LSPRange
 }
 
+struct LSPHover: Equatable, Sendable {
+    let contents: String
+    let range: LSPRange?
+}
+
+struct LSPTextEdit: Equatable, Sendable {
+    let range: LSPRange
+    let newText: String
+}
+
+enum LSPSymbolKind: Int, Codable, Equatable, Hashable, Sendable {
+    case file = 1
+    case module = 2
+    case namespace = 3
+    case package = 4
+    case `class` = 5
+    case method = 6
+    case property = 7
+    case field = 8
+    case constructor = 9
+    case `enum` = 10
+    case interface = 11
+    case function = 12
+    case variable = 13
+    case constant = 14
+    case string = 15
+    case number = 16
+    case boolean = 17
+    case array = 18
+    case object = 19
+    case key = 20
+    case null = 21
+    case enumMember = 22
+    case `struct` = 23
+    case event = 24
+    case `operator` = 25
+    case typeParameter = 26
+
+    var iconName: String {
+        switch self {
+        case .class, .struct, .interface, .object, .typeParameter:
+            return "cube"
+        case .method, .function, .constructor:
+            return "f.cursive"
+        case .property, .field, .variable, .key:
+            return "v.square"
+        case .enum, .enumMember:
+            return "list.bullet.rectangle"
+        case .module, .namespace, .package:
+            return "shippingbox"
+        case .constant, .number:
+            return "number.square"
+        case .file, .string:
+            return "doc.text"
+        default:
+            return "chevron.left.forwardslash.chevron.right"
+        }
+    }
+
+    var badgeColorHex: UInt32 {
+        switch self {
+        case .class, .struct, .interface, .typeParameter:
+            return 0xE5C07B
+        case .method, .function, .constructor:
+            return 0x61AFEF
+        case .property, .field, .variable:
+            return 0xE06C75
+        case .enum, .enumMember, .constant, .module, .namespace, .package:
+            return 0x56B6C2
+        default:
+            return 0xC678DD
+        }
+    }
+}
+
+struct LSPDocumentSymbol: Identifiable, Equatable, Sendable {
+    var id: String {
+        "\(containerName ?? "")::\(name)::\(kind.rawValue)::\(selectionRange.start.line):\(selectionRange.start.character)"
+    }
+    let name: String
+    let detail: String?
+    let kind: LSPSymbolKind
+    let range: LSPRange
+    let selectionRange: LSPRange
+    let containerName: String?
+    let depth: Int
+}
+
+struct WorkspaceReferenceEntry: Identifiable, Equatable, Sendable {
+    var id: String { "\(fileURL.path):\(line):\(column):\(preview)" }
+    let fileURL: URL
+    let relativePath: String
+    let line: Int        // 1-based
+    let column: Int      // 1-based
+    let preview: String
+}
+
 enum LSPDiagnosticSeverity: Int, Codable, Equatable, Hashable, Sendable {
     case error = 1
     case warning = 2

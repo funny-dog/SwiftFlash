@@ -445,73 +445,72 @@ final class TerminalSession: ObservableObject {
     }
 }
 
-// MARK: - IntegratedTerminalView
+// MARK: - IntegratedTerminalView (Multi-Tab Real PTY)
 
 struct IntegratedTerminalView: View {
     @ObservedObject var workspace: WorkspaceState
-    @ObservedObject var session: TerminalSession
+    @ObservedObject var manager: TerminalTabManager
     @ObservedObject private var themeManager = ThemeManager.shared
-
-    private var terminalFont: Font {
-        themeManager.editorSwiftUIFont(size: max(11, themeManager.editorFontSize - 1))
-    }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Output Scroll Area
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(session.lines) { line in
-                            Text(ANSITextParser.renderAttributedString(from: line.spans))
-                                .font(terminalFont)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+            if manager.tabs.count > 1 {
+                HStack(spacing: 4) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(Array(manager.tabs.enumerated()), id: \.element.id) { idx, tab in
+                                let isActive = tab.id == manager.activeTab?.id
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(Color(nsColor: tab.isAlive ? ZedTheme.string : ZedTheme.mutedText))
+                                        .frame(width: 5.5, height: 5.5)
+                                    Text("\(idx + 1): \(tab.title)")
+                                        .font(.system(size: 11, weight: isActive ? .semibold : .regular, design: .monospaced))
+                                        .foregroundColor(Color(nsColor: isActive ? ZedTheme.primaryText : ZedTheme.secondaryText))
+                                        .lineLimit(1)
+                                    Button {
+                                        manager.closeTab(id: tab.id, fallbackDirectory: workspace.rootURL)
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(Color(nsColor: isActive ? ZedTheme.activeTabBackground : ZedTheme.background))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(Color(nsColor: ZedTheme.border), lineWidth: 1)
+                                )
+                                .onTapGesture {
+                                    manager.activeTabID = tab.id
+                                }
+                            }
                         }
-                        Color.clear
-                            .frame(height: 1)
-                            .id("BOTTOM_ANCHOR")
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    Spacer(minLength: 4)
                 }
-                .onChange(of: session.outputRevision) { _, _ in
-                    proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Color(nsColor: ZedTheme.sidebarBackground))
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color(nsColor: ZedTheme.border)).frame(height: 1)
                 }
             }
-            .background(Color(nsColor: ZedTheme.background))
 
-            // Prompt Input Line
-            HStack(spacing: 8) {
-                Text("\(session.currentDirectory.lastPathComponent) %")
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color(nsColor: ZedTheme.string))
-
-                TextField(L10n("terminal.inputPlaceholder"), text: $session.commandInput)
-                    .textFieldStyle(.plain)
-                    .font(terminalFont)
-                    .foregroundColor(Color(nsColor: ZedTheme.primaryText))
-                    .onSubmit {
-                        session.runCommand()
-                    }
-                    .onKeyPress(.upArrow) {
-                        session.historyUp()
-                        return .handled
-                    }
-                    .onKeyPress(.downArrow) {
-                        session.historyDown()
-                        return .handled
-                    }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Color(nsColor: ZedTheme.sidebarBackground))
-            .overlay(alignment: .top) {
-                Rectangle().fill(Color(nsColor: ZedTheme.border)).frame(height: 1)
+            if let activeSession = manager.activeTab {
+                PTYTerminalRepresentable(session: activeSession)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(nsColor: ZedTheme.background))
             }
         }
         .onChange(of: workspace.rootURL) { _, newRoot in
-            session.syncWorkingDirectory(newRoot)
+            manager.syncWorkspaceDirectory(newRoot)
         }
     }
 }

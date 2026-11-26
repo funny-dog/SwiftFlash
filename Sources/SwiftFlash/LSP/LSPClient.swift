@@ -211,6 +211,168 @@ enum LSPPayloadParser {
         )
     }
 
+    static func parseHover(from result: Any?) -> LSPHover? {
+        guard let dict = result as? [String: Any], let rawContents = dict["contents"] else {
+            return nil
+        }
+        let text = extractHoverMarkdown(rawContents).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let range = (dict["range"] as? [String: Any]).flatMap(parseRange)
+        return LSPHover(contents: text, range: range)
+    }
+
+    private static func extractHoverMarkdown(_ raw: Any) -> String {
+        if let str = raw as? String {
+            return str
+        }
+        if let dict = raw as? [String: Any] {
+            if let value = dict["value"] as? String {
+                if let lang = dict["language"] as? String, !lang.isEmpty {
+                    return "```\(lang)\n\(value)\n```"
+                }
+                return value
+            }
+        }
+        if let list = raw as? [Any] {
+            return list
+                .map { extractHoverMarkdown($0) }
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .joined(separator: "\n\n")
+        }
+        return ""
+    }
+
+    static func parseTextEdits(from result: Any?) -> [LSPTextEdit] {
+        guard let rawEdits = result as? [[String: Any]] else { return [] }
+        return rawEdits.compactMap { dict in
+            guard let rangeDict = dict["range"] as? [String: Any],
+                  let range = parseRange(rangeDict),
+                  let newText = dict["newText"] as? String else {
+                return nil
+            }
+            return LSPTextEdit(range: range, newText: newText)
+        }
+    }
+
+    static func parseDocumentSymbols(from result: Any?) -> [LSPDocumentSymbol] {
+        guard let rawItems = result as? [[String: Any]] else { return [] }
+        var flattened: [LSPDocumentSymbol] = []
+
+        func walkDocumentSymbol(_ dict: [String: Any], container: String?, depth: Int) {
+            guard let name = dict["name"] as? String, !name.isEmpty else { return }
+            let rawKind = dict["kind"] as? Int ?? LSPSymbolKind.function.rawValue
+            let kind = LSPSymbolKind(rawValue: rawKind) ?? .function
+            let detail = dict["detail"] as? String
+
+            if let rangeDict = dict["range"] as? [String: Any],
+               let range = parseRange(rangeDict) {
+                let selRange = (dict["selectionRange"] as? [String: Any]).flatMap(parseRange) ?? range
+                flattened.append(LSPDocumentSymbol(
+                    name: name,
+                    detail: detail,
+                    kind: kind,
+                    range: range,
+                    selectionRange: selRange,
+                    containerName: container,
+                    depth: depth
+                ))
+                if let children = dict["children"] as? [[String: Any]] {
+                    for child in children {
+                        walkDocumentSymbol(child, container: name, depth: depth + 1)
+                    }
+                }
+            } else if let locDict = dict["location"] as? [String: Any],
+                      let rangeDict = locDict["range"] as? [String: Any],
+                      let range = parseRange(rangeDict) {
+                let containerName = dict["containerName"] as? String
+                flattened.append(LSPDocumentSymbol(
+                    name: name,
+                    detail: detail,
+                    kind: kind,
+                    range: range,
+                    selectionRange: range,
+                    containerName: containerName,
+                    depth: (containerName?.isEmpty == false) ? 1 : 0
+                ))
+            }
+        }
+
+        for item in rawItems {
+            walkDocumentSymbol(item, container: nil, depth: 0)
+        }
+        return flattened
+    }
+
+    static func applyTextEdits(_ edits: [LSPTextEdit], to text: String) -> String {
+        guard !edits.isEmpty else { return text }
+        let nsText = text as NSString
+
+        // Build UTF-16 line start table once: O(N)
+        var lineStarts: [Int] = [0]
+        let totalLen = nsText.length
+        var i = 0
+        while i < totalLen {
+            let ch = nsText.character(at: i)
+            if ch == 0x000A {
+                lineStarts.append(i + 1)
+            }
+            i += 1
+        }
+
+        func utf16Offset(for pos: LSPPosition) -> Int {
+            guard pos.line >= 0 else { return 0 }
+            if pos.line >= lineStarts.count {
+                return totalLen
+            }
+            let lineStart = lineStarts[pos.line]
+            let lineEnd: Int
+            if pos.line + 1 < lineStarts.count {
+                var end = lineStarts[pos.line + 1] - 1
+                if end > lineStart && nsText.character(at: end - 1) == 0x000D {
+                    end -= 1
+                }
+                lineEnd = max(lineStart, end)
+            } else {
+                lineEnd = totalLen
+            }
+            return min(max(lineStart, lineStart + max(0, pos.character)), max(lineEnd, lineStart))
+        }
+
+        struct ResolvedEdit {
+            let range: NSRange
+            let newText: String
+            let order: Int
+        }
+
+        var resolved: [ResolvedEdit] = []
+        resolved.reserveCapacity(edits.count)
+        for (idx, edit) in edits.enumerated() {
+            let start = utf16Offset(for: edit.range.start)
+            let end = max(start, utf16Offset(for: edit.range.end))
+            resolved.append(ResolvedEdit(range: NSRange(location: start, length: end - start), newText: edit.newText, order: idx))
+        }
+
+        // Apply from bottom-to-top so earlier offsets remain valid.
+        resolved.sort { lhs, rhs in
+            if lhs.range.location != rhs.range.location {
+                return lhs.range.location > rhs.range.location
+            }
+            if lhs.range.length != rhs.range.length {
+                return lhs.range.length > rhs.range.length
+            }
+            return lhs.order > rhs.order
+        }
+
+        let mutable = NSMutableString(string: text)
+        for edit in resolved {
+            guard edit.range.location >= 0, edit.range.location + edit.range.length <= mutable.length else {
+                continue
+            }
+            mutable.replaceCharacters(in: edit.range, with: edit.newText)
+        }
+        return mutable as String
+    }
+
     static func sanitizeSnippetPlaceholders(_ text: String) -> String {
         guard text.contains("$") else { return text }
         var output = text
@@ -525,6 +687,14 @@ final class LSPServerConnection: @unchecked Sendable {
                     "definition": [
                         "linkSupport": true
                     ],
+                    "hover": [
+                        "contentFormat": ["markdown", "plaintext"]
+                    ],
+                    "references": [:],
+                    "formatting": [:],
+                    "documentSymbol": [
+                        "hierarchicalDocumentSymbolSupport": true
+                    ],
                     "publishDiagnostics": [
                         "relatedInformation": false
                     ]
@@ -609,6 +779,59 @@ final class LSPServerConnection: @unchecked Sendable {
             timeoutSeconds: 4.0
         )
         return LSPPayloadParser.parseLocations(from: Self.extractResult(from: payload))
+    }
+
+    func hover(url: URL, line: Int, character: Int) async throws -> LSPHover? {
+        let payload = try await sendRequestPayload(
+            method: "textDocument/hover",
+            params: [
+                "textDocument": ["uri": url.absoluteString],
+                "position": ["line": line, "character": character]
+            ],
+            timeoutSeconds: 3.5
+        )
+        return LSPPayloadParser.parseHover(from: Self.extractResult(from: payload))
+    }
+
+    func references(url: URL, line: Int, character: Int, includeDeclaration: Bool = true) async throws -> [LSPLocation] {
+        let payload = try await sendRequestPayload(
+            method: "textDocument/references",
+            params: [
+                "textDocument": ["uri": url.absoluteString],
+                "position": ["line": line, "character": character],
+                "context": ["includeDeclaration": includeDeclaration]
+            ],
+            timeoutSeconds: 6.0
+        )
+        return LSPPayloadParser.parseLocations(from: Self.extractResult(from: payload))
+    }
+
+    func formatting(url: URL, tabSize: Int = 4, insertSpaces: Bool = true) async throws -> [LSPTextEdit] {
+        let payload = try await sendRequestPayload(
+            method: "textDocument/formatting",
+            params: [
+                "textDocument": ["uri": url.absoluteString],
+                "options": [
+                    "tabSize": tabSize,
+                    "insertSpaces": insertSpaces,
+                    "trimTrailingWhitespace": true,
+                    "insertFinalNewline": true
+                ]
+            ],
+            timeoutSeconds: 8.0
+        )
+        return LSPPayloadParser.parseTextEdits(from: Self.extractResult(from: payload))
+    }
+
+    func documentSymbols(url: URL) async throws -> [LSPDocumentSymbol] {
+        let payload = try await sendRequestPayload(
+            method: "textDocument/documentSymbol",
+            params: [
+                "textDocument": ["uri": url.absoluteString]
+            ],
+            timeoutSeconds: 5.0
+        )
+        return LSPPayloadParser.parseDocumentSymbols(from: Self.extractResult(from: payload))
     }
 
     func shutdownNow() {

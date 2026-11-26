@@ -360,6 +360,7 @@ final class ThemeManager: ObservableObject {
         static let editorFontSize = "swiftflash.editorFontSize"
         static let lineHeightMultiplier = "swiftflash.lineHeightMultiplier"
         static let uiFontSize = "swiftflash.uiFontSize"
+        static let formatOnSave = "swiftflash.formatOnSave"
     }
 
     private static let preferredFontOrder = [
@@ -418,6 +419,12 @@ final class ThemeManager: ObservableObject {
                 return
             }
             UserDefaults.standard.set(Double(clamped), forKey: Keys.uiFontSize)
+        }
+    }
+
+    @Published var formatOnSave: Bool {
+        didSet {
+            UserDefaults.standard.set(formatOnSave, forKey: Keys.formatOnSave)
         }
     }
 
@@ -512,6 +519,8 @@ final class ThemeManager: ObservableObject {
 
         let savedUIFontSize = defaults.double(forKey: Keys.uiFontSize)
         self.uiFontSize = savedUIFontSize >= 11 && savedUIFontSize <= 16 ? CGFloat(savedUIFontSize) : 12.5
+
+        self.formatOnSave = defaults.bool(forKey: Keys.formatOnSave)
     }
 
     func increaseFontSize() {

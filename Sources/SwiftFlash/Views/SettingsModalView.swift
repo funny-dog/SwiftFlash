@@ -193,6 +193,14 @@ struct ThemeAndFontSettingsModalView: View {
                                     onReset: nil
                                 )
                             }
+
+                            Toggle(isOn: $themeManager.formatOnSave) {
+                                Text(L10n("settings.formatOnSave"))
+                                    .font(.system(size: 12.5))
+                                    .foregroundColor(Color(nsColor: ZedTheme.primaryText))
+                            }
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
                         }
 
                         // Live Editor Preview

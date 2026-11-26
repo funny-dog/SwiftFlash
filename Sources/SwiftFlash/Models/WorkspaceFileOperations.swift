@@ -155,24 +155,45 @@ extension WorkspaceState {
 
     // MARK: - Open, Create, Rename, Duplicate, Delete Files
 
-    func openFile(url: URL, atLine line: Int? = nil, atColumn column: Int? = nil) {
+    func openFile(
+        url: URL,
+        atLine line: Int? = nil,
+        atColumn column: Int? = nil,
+        recordHistory: Bool = true,
+        targetPane: EditorPane? = nil
+    ) {
         let targetURL = url.standardized
+        let resolvedPane = targetPane ?? (isSplitEditorActive ? focusedEditorPane : .primary)
+
+        if recordHistory {
+            recordCurrentNavigationLocation()
+        }
+
         if let existingIdx = openTabs.firstIndex(where: { $0.url?.standardized.path == targetURL.path }) {
             let targetID = openTabs[existingIdx].id
-            let alreadyActive = (activeTabID == targetID)
-            activeTabID = targetID
+            let alreadyShowingInPane: Bool
+            if resolvedPane == .secondary && isSplitEditorActive {
+                alreadyShowingInPane = (secondaryTabID == targetID)
+                secondaryTabID = targetID
+                focusedEditorPane = .secondary
+            } else {
+                alreadyShowingInPane = (activeTabID == targetID)
+                activeTabID = targetID
+                focusedEditorPane = .primary
+            }
+
             if let line {
-                if alreadyActive {
-                    // Already showing this tab in the editor: jump directly.
-                    onJumpToLocationRequested?(line, column)
+                if alreadyShowingInPane {
+                    handlers(for: resolvedPane)?.jumpToLocation?(line, column)
                 } else {
-                    // Switching from another tab: defer jump to `syncWithTab` so we never
-                    // jump inside the previous tab's buffer before switching.
                     openTabs[existingIdx].pendingJumpLine = line
                     openTabs[existingIdx].pendingJumpColumn = column
                 }
             }
-            onFocusEditorRequested?()
+            refreshTasksForCurrentContext()
+            refreshActiveDocumentSymbols()
+            handlers(for: resolvedPane)?.focusEditor?()
+            persistCurrentProjectSession()
             return
         }
 
@@ -210,12 +231,20 @@ extension WorkspaceState {
             pendingJumpColumn: column
         )
         openTabs.append(tab)
-        activeTabID = tab.id
+        if resolvedPane == .secondary && isSplitEditorActive {
+            secondaryTabID = tab.id
+            focusedEditorPane = .secondary
+        } else {
+            activeTabID = tab.id
+            focusedEditorPane = .primary
+        }
         updateRenderLatency(elapsedMs)
         statusMessage = L10n("status.openedFileFormat", targetURL.lastPathComponent, elapsedMs)
         refreshTasksForCurrentContext()
         connectTabToLSP(tab)
-        onFocusEditorRequested?()
+        refreshActiveDocumentSymbols()
+        handlers(for: resolvedPane)?.focusEditor?()
+        persistCurrentProjectSession()
     }
 
     func createNewUntitledFile() {
@@ -558,9 +587,23 @@ extension WorkspaceState {
 
     @discardableResult
     func saveActiveTab() -> Bool {
-        guard let activeTabID,
-              let idx = openTabs.firstIndex(where: { $0.id == activeTabID }) else { return false }
+        guard let targetID = focusedTabID,
+              let idx = openTabs.firstIndex(where: { $0.id == targetID }) else { return false }
         return saveTab(at: idx)
+    }
+
+    func saveActiveTabWithOptionalFormatting() {
+        guard let tab = focusedTab, tab.virtualKey == nil else {
+            _ = saveActiveTab()
+            return
+        }
+        if ThemeManager.shared.formatOnSave && isProductionDefaults {
+            formatActiveDocument { [weak self] in
+                _ = self?.saveActiveTab()
+            }
+        } else {
+            _ = saveActiveTab()
+        }
     }
 
     @discardableResult
@@ -687,7 +730,7 @@ extension WorkspaceState {
     // MARK: - In-File Find & Replace + Go to Line
 
     func presentFindBar(replace: Bool) {
-        guard let tab = activeTab else { return }
+        guard let tab = focusedTab else { return }
         findState.isGoToLineVisible = false
         findState.isFindBarVisible = true
         if replace {
@@ -708,7 +751,7 @@ extension WorkspaceState {
     }
 
     func presentGoToLine() {
-        guard activeTab != nil else { return }
+        guard focusedTab != nil else { return }
         findState.isFindBarVisible = false
         findState.isGoToLineVisible = true
         findState.goToLineInput = ""
@@ -723,7 +766,7 @@ extension WorkspaceState {
     }
 
     func recomputeFindMatches(fromCursor overrideCursor: Int? = nil) {
-        guard let tab = activeTab else {
+        guard let tab = focusedTab else {
             findState.matches = []
             findState.currentMatchIndex = -1
             onFindMatchesChanged?()
@@ -735,7 +778,7 @@ extension WorkspaceState {
     }
 
     func findNextInActiveFile() {
-        guard let tab = activeTab else { return }
+        guard let tab = focusedTab else { return }
         if findState.matches.isEmpty && !findState.findQuery.isEmpty {
             recomputeFindMatches()
         }
@@ -747,7 +790,7 @@ extension WorkspaceState {
     }
 
     func findPreviousInActiveFile() {
-        guard let tab = activeTab else { return }
+        guard let tab = focusedTab else { return }
         if findState.matches.isEmpty && !findState.findQuery.isEmpty {
             recomputeFindMatches()
         }
@@ -759,7 +802,7 @@ extension WorkspaceState {
     }
 
     func replaceCurrentInActiveFile() {
-        guard let tab = activeTab, tab.virtualKey == nil, !findState.matches.isEmpty else { return }
+        guard let tab = focusedTab, tab.virtualKey == nil, !findState.matches.isEmpty else { return }
         let idx = (findState.currentMatchIndex >= 0 && findState.currentMatchIndex < findState.matches.count)
             ? findState.currentMatchIndex
             : 0
@@ -784,7 +827,7 @@ extension WorkspaceState {
     }
 
     func replaceAllInActiveFile() {
-        guard let tab = activeTab, tab.virtualKey == nil, !findState.findQuery.isEmpty else { return }
+        guard let tab = focusedTab, tab.virtualKey == nil, !findState.findQuery.isEmpty else { return }
         let result = EditorFindEngine.replaceAll(
             in: tab.content,
             query: findState.findQuery,
@@ -801,6 +844,7 @@ extension WorkspaceState {
     func commitGoToLine() {
         let trimmed = findState.goToLineInput.trimmingCharacters(in: .whitespacesAndNewlines)
         if let line = Int(trimmed), line > 0 {
+            recordCurrentNavigationLocation()
             onJumpToLocationRequested?(line, nil)
         }
         findState.isGoToLineVisible = false

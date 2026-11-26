@@ -182,6 +182,7 @@ struct EditorTab: Identifiable, Equatable {
     var pendingJumpLine: Int?
     var pendingJumpColumn: Int?
     var externalReloadRevision: Int = 0
+    var hasExternalConflict: Bool = false
 
     @MainActor
     var content: String {
@@ -200,7 +201,8 @@ struct EditorTab: Identifiable, Equatable {
         language: CodeLanguage,
         pendingJumpLine: Int? = nil,
         pendingJumpColumn: Int? = nil,
-        externalReloadRevision: Int = 0
+        externalReloadRevision: Int = 0,
+        hasExternalConflict: Bool = false
     ) {
         self.id = id
         self.url = url
@@ -213,6 +215,7 @@ struct EditorTab: Identifiable, Equatable {
         self.pendingJumpLine = pendingJumpLine
         self.pendingJumpColumn = pendingJumpColumn
         self.externalReloadRevision = externalReloadRevision
+        self.hasExternalConflict = hasExternalConflict
     }
 
     /// Updates buffer text in place and returns whether `isDirty` changed.
@@ -232,6 +235,7 @@ struct EditorTab: Identifiable, Equatable {
         contentBox.text = newText
         savedContent = newText
         isDirty = false
+        hasExternalConflict = false
     }
 
     static func == (lhs: EditorTab, rhs: EditorTab) -> Bool {
@@ -244,7 +248,13 @@ struct EditorTab: Identifiable, Equatable {
             && lhs.externalReloadRevision == rhs.externalReloadRevision
             && lhs.pendingJumpLine == rhs.pendingJumpLine
             && lhs.pendingJumpColumn == rhs.pendingJumpColumn
+            && lhs.hasExternalConflict == rhs.hasExternalConflict
     }
+}
+
+enum EditorPane: String, Equatable, Hashable, Sendable {
+    case primary
+    case secondary
 }
 
 struct SearchMatch: Identifiable, Hashable, Sendable {
@@ -336,6 +346,8 @@ enum OverlayPanelMode: Equatable, Sendable {
     case worktreeSwitcher
     case branchSwitcher
     case quickOpen
+    case commandPalette
+    case symbolOutline
     case settings
 }
 
@@ -343,6 +355,8 @@ enum OverlayPanelMode: Equatable, Sendable {
 struct ProjectSessionSnapshot {
     var openTabs: [EditorTab]
     var activeTabID: UUID?
+    var secondaryTabID: UUID?
+    var isSplitEditorActive: Bool
     var tabViewStates: [UUID: TabViewState]
 }
 

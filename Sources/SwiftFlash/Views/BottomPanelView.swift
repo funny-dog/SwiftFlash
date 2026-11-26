@@ -5,11 +5,12 @@ enum BottomPanelTab: String, CaseIterable, Sendable {
     case terminal
     case run
     case problems
+    case references
 }
 
 struct BottomPanelView: View {
     @ObservedObject var workspace: WorkspaceState
-    @ObservedObject var session: TerminalSession
+    @ObservedObject var terminalManager: TerminalTabManager
     @ObservedObject var taskRunner: TaskRunnerState
     @ObservedObject private var themeManager = ThemeManager.shared
 
@@ -23,11 +24,13 @@ struct BottomPanelView: View {
 
             switch workspace.bottomPanelTab {
             case .terminal:
-                IntegratedTerminalView(workspace: workspace, session: session)
+                IntegratedTerminalView(workspace: workspace, manager: terminalManager)
             case .run:
                 runOutputBody
             case .problems:
                 problemsBody
+            case .references:
+                referencesBody
             }
         }
         .background(Color(nsColor: ZedTheme.background))
@@ -39,8 +42,8 @@ struct BottomPanelView: View {
                 tab: .terminal,
                 icon: "terminal.fill",
                 title: L10n("panel.tab.terminal"),
-                badgeCount: 0,
-                badgeColor: ZedTheme.string
+                badgeCount: terminalManager.tabs.count > 1 ? terminalManager.tabs.count : 0,
+                badgeColor: ZedTheme.function
             )
 
             tabPill(
@@ -61,36 +64,42 @@ struct BottomPanelView: View {
                 badgeColor: errorCount > 0 ? NSColor(hex: 0xE06C75) : NSColor(hex: 0xE5C07B)
             )
 
+            tabPill(
+                tab: .references,
+                icon: "point.3.connected.trianglepath.dotted",
+                title: L10n("panel.tab.references"),
+                badgeCount: workspace.referenceResults.count,
+                badgeColor: ZedTheme.function
+            )
+
             Spacer()
 
             if workspace.bottomPanelTab == .terminal {
-                Text(session.currentDirectory.lastPathComponent)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(Color(nsColor: ZedTheme.mutedText))
-
-                if session.isRunning {
-                    ProgressView()
-                        .scaleEffect(0.5)
-                        .frame(width: 12, height: 12)
+                if let activeTerm = terminalManager.activeTab {
+                    Text(activeTerm.currentDirectory.lastPathComponent)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(Color(nsColor: ZedTheme.mutedText))
                 }
 
                 if let buildTask = taskRunner.detectedTasks.first(where: { $0.kind == .build }) {
                     quickChip(buildTask.name, color: ZedTheme.function) {
-                        session.runCommand(buildTask.command)
+                        terminalManager.activeTab?.sendCommand(buildTask.command)
                     }
                 }
                 if workspace.isGitRepository {
                     quickChip("git status", color: ZedTheme.keyword) {
-                        session.runCommand("git status -sb")
+                        terminalManager.activeTab?.sendCommand("git status -sb")
                     }
                 }
-                if session.isRunning {
-                    quickChip(L10n("terminal.stop"), color: ZedTheme.attribute) {
-                        session.terminateRunningCommand()
-                    }
+
+                headerIcon(icon: "plus", help: L10n("terminal.newTab")) {
+                    terminalManager.createTab(in: workspace.rootURL)
+                }
+                headerIcon(icon: "arrow.clockwise", help: L10n("terminal.restartHelp")) {
+                    terminalManager.activeTab?.restart(in: workspace.rootURL)
                 }
                 headerIcon(icon: "trash", help: L10n("terminal.clearHelp")) {
-                    session.clear()
+                    terminalManager.activeTab?.clearScreen()
                 }
             } else if workspace.bottomPanelTab == .run {
                 if !taskRunner.activeTaskName.isEmpty {
@@ -118,6 +127,17 @@ struct BottomPanelView: View {
                     Text(L10n("problems.summaryFormat", errorCount, warningCount))
                         .font(.system(size: 11))
                         .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                }
+            } else if workspace.bottomPanelTab == .references {
+                if !workspace.referenceTargetTitle.isEmpty {
+                    Text(workspace.referenceTargetTitle)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(Color(nsColor: ZedTheme.function))
+                }
+                if workspace.isLoadingReferences {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
                 }
             }
 
@@ -274,6 +294,65 @@ struct BottomPanelView: View {
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 5)
                                 .background(Color.clear)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            }
+        }
+    }
+
+    private var referencesBody: some View {
+        Group {
+            if workspace.isLoadingReferences {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text(L10n("lsp.references.loading"))
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if workspace.referenceResults.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 18))
+                        .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                    Text(L10n("lsp.references.empty"))
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(nsColor: ZedTheme.mutedText))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(workspace.referenceResults) { entry in
+                            Button {
+                                workspace.openFile(
+                                    url: entry.fileURL,
+                                    atLine: entry.line,
+                                    atColumn: entry.column
+                                )
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Text("\(entry.relativePath):\(entry.line):\(entry.column)")
+                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                        .foregroundColor(Color(nsColor: ZedTheme.function))
+                                        .lineLimit(1)
+
+                                    Text(entry.preview)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                        .foregroundColor(Color(nsColor: ZedTheme.secondaryText))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+
+                                    Spacer(minLength: 4)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
